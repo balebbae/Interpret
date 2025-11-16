@@ -14,3 +14,6 @@ speechbrain==1.0.3
 torch==2.1.2
 torchaudio==2.1.2
 pyannote.audio==3.1.1
+
+# Pin huggingface_hub to version that supports use_auth_token
+huggingface_hub==0.23.5

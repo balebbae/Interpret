@@ -33,6 +33,26 @@ else:
 
 app = FastAPI(title="Audio Separation Service")
 
+# Global pipeline - loaded once at startup
+_diarization_pipeline = None
+
+def get_diarization_pipeline():
+    """Get or load the diarization pipeline (singleton pattern)"""
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        logger.info("Loading pyannote diarization pipeline...")
+        try:
+            _diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization",
+                use_auth_token=HF_TOKEN
+            )
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _diarization_pipeline.to(device)
+            logger.info(f"Pipeline loaded on {device}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load pyannote pipeline: {e}")
+    return _diarization_pipeline
+
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
@@ -121,23 +141,14 @@ def load_audio_to_mono_16k(path, target_sr=16000):
     return samples, target_sr
 
 
-def run_diarization(path):
+def run_diarization(wav_path):
     """
     Run speaker diarization on a 16k mono WAV using GPU if available.
     Returns list of (start_sec, end_sec, speaker_id), sorted by time.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Diarization device: {device}")
+    logger.info(f"Running diarization on {wav_path}")
 
-    wav_path = ensure_wav_16k_mono(path)
-
-    try:
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load pyannote pipeline: {e}")
-
-    pipeline.to(device)
-
+    pipeline = get_diarization_pipeline()
     diarization = pipeline(wav_path)
 
     segments = []
@@ -258,29 +269,37 @@ def process_audio(input_file: str, job_id: str) -> tuple[str, str]:
     """
     logger.info(f"Starting audio processing for job {job_id}")
 
-    # 1. Load audio as 16k mono for slicing
-    y, sr = load_audio_to_mono_16k(input_file, target_sr=16000)
+    # 1. Convert to 16k mono WAV once (used for both diarization and slicing)
+    wav_path = ensure_wav_16k_mono(input_file, target_sr=16000)
+
+    # 2. Load audio as numpy array for slicing
+    y, sr = load_audio_to_mono_16k(wav_path, target_sr=16000)
     logger.info(f"Loaded audio: {len(y)} samples at {sr} Hz")
 
-    # 2. Diarization (who speaks when)
-    diar_segments = run_diarization(input_file)
+    # 3. Diarization (who speaks when)
+    diar_segments = run_diarization(wav_path)
     num_speakers = len({spk for _, _, spk in diar_segments})
     logger.info(f"Diarization segments: {len(diar_segments)}, speakers: {num_speakers}")
 
     if not diar_segments:
         raise RuntimeError("No segments from diarization – check audio/pyannote.")
 
-    # 3. Assign each speaker to track 'lang1' or 'lang2'
+    # 4. Assign each speaker to track 'lang1' or 'lang2'
     speaker_track = assign_speakers_to_tracks(diar_segments)
 
-    # 4. Build tracks
+    # 5. Build tracks
     track_1, track_2 = build_tracks_from_diarization(y, sr, diar_segments, speaker_track)
     logger.info(f"Built tracks: lang1={len(track_1)} samples, lang2={len(track_2)} samples")
 
-    # 5. Export
+    # 6. Export
     output1 = f"/tmp/{job_id}_language1.mp3"
     output2 = f"/tmp/{job_id}_language2.mp3"
     export_tracks(track_1, track_2, sr, output1, output2)
+
+    # 7. Cleanup intermediate WAV file
+    if os.path.exists(wav_path):
+        os.remove(wav_path)
+        logger.info(f"Cleaned up {wav_path}")
 
     logger.info(f"Saved {output1} and {output2}")
     return output1, output2

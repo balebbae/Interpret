@@ -51,26 +51,32 @@ export async function POST(request: NextRequest) {
     // Create job in store
     const job = createJob(jobId, fileName);
 
-    // Submit job to Cloud Run processing service
+    // Submit job to Cloud Run processing service (non-blocking with timeout)
     const cloudRunEndpoint = process.env.CLOUD_RUN_ENDPOINT;
     if (cloudRunEndpoint) {
-      try {
-        await fetch(`${cloudRunEndpoint}/process`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            jobId,
-            inputFile: fileName,
-            inputBucket: bucketName,
-            outputBucket: process.env.GOOGLE_CLOUD_BUCKET_OUTPUT,
-          }),
+      // Fire and forget - don't wait for Cloud Run response
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+      fetch(`${cloudRunEndpoint}/process`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          jobId,
+          inputFile: fileName,
+          inputBucket: bucketName,
+          outputBucket: process.env.GOOGLE_CLOUD_BUCKET_OUTPUT,
+        }),
+        signal: controller.signal,
+      })
+        .then(() => clearTimeout(timeoutId))
+        .catch((error) => {
+          clearTimeout(timeoutId);
+          console.error('Failed to submit job to Cloud Run:', error);
         });
-      } catch (error) {
-        console.error('Failed to submit job to Cloud Run:', error);
-        // Continue anyway - job can be processed later
-      }
+      // Don't await - return immediately to user
     }
 
     const response: UploadResponse = {
