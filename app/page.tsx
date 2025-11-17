@@ -21,32 +21,58 @@ export default function Home() {
     setIsProcessing(true);
     setError(null);
     setResult(null);
-    setProcessingStatus("Uploading and processing audio... This may take several minutes for long files.");
+    setProcessingStatus("Processing audio... This may take several minutes for long files.");
 
     try {
-      const formData = new FormData();
-      formData.append('file', files[0]);
+      // Validate file type
+      const file = files[0];
+      if (!file.type.includes('audio/mpeg') && !file.name.endsWith('.mp3')) {
+        throw new Error('Invalid file type. Only MP3 files are allowed.');
+      }
 
-      const response = await fetch('/api/upload', {
+      // Convert file to base64
+      setProcessingStatus("Preparing audio file...");
+      const arrayBuffer = await file.arrayBuffer();
+      const base64 = btoa(
+        new Uint8Array(arrayBuffer).reduce(
+          (data, byte) => data + String.fromCharCode(byte),
+          ''
+        )
+      );
+
+      // Call Modal directly (bypasses Vercel size limits)
+      setProcessingStatus("Sending to GPU for processing... This may take several minutes.");
+      const modalEndpoint = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
+
+      if (!modalEndpoint) {
+        throw new Error('Modal endpoint not configured');
+      }
+
+      const response = await fetch(modalEndpoint, {
         method: 'POST',
-        body: formData,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ audio_base64: base64 }),
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
+        const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.error || 'Processing failed');
       }
 
       const data = await response.json();
 
-      if (data.success) {
+      if (data.language1 && data.language2) {
         setResult({
           language1: data.language1,
           language2: data.language2,
         });
         setProcessingStatus("Processing complete!");
+      } else if (data.error) {
+        throw new Error(data.error);
       } else {
-        throw new Error(data.error || 'Processing failed');
+        throw new Error('Invalid response from server');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to process file');
