@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { uploadToStorage } from '@/lib/storage';
-import { createJob } from '@/lib/job-store';
-import { UploadResponse } from '@/lib/types';
-import { randomUUID } from 'crypto';
+
+export interface SeparationResponse {
+  language1: string; // Base64 encoded MP3
+  language2: string; // Base64 encoded MP3
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -24,72 +25,55 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Generate unique job ID
-    const jobId = randomUUID();
-    const fileName = `${jobId}-${file.name}`;
-
-    // Convert File to Buffer
+    // Convert File to base64
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
+    const audioBase64 = buffer.toString('base64');
 
-    // Upload to Google Cloud Storage
-    const bucketName = process.env.GOOGLE_CLOUD_BUCKET_INPUT;
-    if (!bucketName) {
+    // Get Modal endpoint
+    const modalEndpoint = process.env.MODAL_ENDPOINT;
+    if (!modalEndpoint) {
       return NextResponse.json(
-        { error: 'Server configuration error: bucket not configured' },
+        { error: 'Server configuration error: Modal endpoint not configured' },
         { status: 500 }
       );
     }
 
-    const gcsPath = await uploadToStorage(
-      buffer,
-      fileName,
-      bucketName,
-      file.type
-    );
+    // Send to Modal for processing (synchronous - wait for result)
+    console.log('Sending audio to Modal for processing...');
+    const modalResponse = await fetch(modalEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        audio_base64: audioBase64,
+      }),
+    });
 
-    // Create job in store
-    const job = createJob(jobId, fileName);
-
-    // Submit job to Cloud Run processing service (non-blocking with timeout)
-    const cloudRunEndpoint = process.env.CLOUD_RUN_ENDPOINT;
-    if (cloudRunEndpoint) {
-      // Fire and forget - don't wait for Cloud Run response
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-      fetch(`${cloudRunEndpoint}/process`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jobId,
-          inputFile: fileName,
-          inputBucket: bucketName,
-          outputBucket: process.env.GOOGLE_CLOUD_BUCKET_OUTPUT,
-        }),
-        signal: controller.signal,
-      })
-        .then(() => clearTimeout(timeoutId))
-        .catch((error) => {
-          clearTimeout(timeoutId);
-          console.error('Failed to submit job to Cloud Run:', error);
-        });
-      // Don't await - return immediately to user
+    if (!modalResponse.ok) {
+      const errorData = await modalResponse.json().catch(() => ({}));
+      console.error('Modal processing failed:', errorData);
+      return NextResponse.json(
+        { error: errorData.error || 'Audio processing failed' },
+        { status: 500 }
+      );
     }
 
-    const response: UploadResponse = {
-      jobId,
-      status: job.status,
-      message: 'File uploaded successfully. Processing started.',
-    };
+    const result: SeparationResponse = await modalResponse.json();
+    console.log('Modal processing complete');
 
-    return NextResponse.json(response);
+    // Return the separated audio files
+    return NextResponse.json({
+      success: true,
+      language1: result.language1,
+      language2: result.language2,
+      message: 'Audio separation completed successfully',
+    });
   } catch (error) {
-    console.error('Upload error:', error);
+    console.error('Upload/processing error:', error);
     return NextResponse.json(
-      { error: 'Failed to upload file' },
+      { error: 'Failed to process audio file' },
       { status: 500 }
     );
   }

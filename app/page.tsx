@@ -2,42 +2,26 @@
 
 import { SimpleTree } from "@/components/ui/simple-growth-tree";
 import { FileUpload } from "@/components/ui/file-upload";
-import { Input } from "@/components/ui/input";
-import { useState, useEffect } from "react";
-import { ProcessingJob } from "@/lib/types";
+import { useState } from "react";
+
+interface ProcessingResult {
+  language1: string; // Base64 encoded MP3
+  language2: string; // Base64 encoded MP3
+}
 
 export default function Home() {
-  const [youtubeLink, setYoutubeLink] = useState("");
-  const [currentJob, setCurrentJob] = useState<ProcessingJob | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Poll for job status
-  useEffect(() => {
-    if (!currentJob || currentJob.status === 'completed' || currentJob.status === 'failed') {
-      return;
-    }
-
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch(`/api/status/${currentJob.jobId}`);
-        if (response.ok) {
-          const data = await response.json();
-          setCurrentJob(data.job);
-        }
-      } catch (err) {
-        console.error('Failed to poll status:', err);
-      }
-    }, 3000); // Poll every 3 seconds
-
-    return () => clearInterval(pollInterval);
-  }, [currentJob]);
+  const [result, setResult] = useState<ProcessingResult | null>(null);
+  const [processingStatus, setProcessingStatus] = useState<string>("");
 
   const handleFileUpload = async (files: File[]) => {
     if (files.length === 0) return;
 
-    setIsUploading(true);
+    setIsProcessing(true);
     setError(null);
+    setResult(null);
+    setProcessingStatus("Uploading and processing audio... This may take several minutes for long files.");
 
     try {
       const formData = new FormData();
@@ -50,38 +34,51 @@ export default function Home() {
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.error || 'Upload failed');
+        throw new Error(errorData.error || 'Processing failed');
       }
 
       const data = await response.json();
 
-      // Create initial job object
-      setCurrentJob({
-        jobId: data.jobId,
-        status: data.status,
-        inputFile: files[0].name,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
+      if (data.success) {
+        setResult({
+          language1: data.language1,
+          language2: data.language2,
+        });
+        setProcessingStatus("Processing complete!");
+      } else {
+        throw new Error(data.error || 'Processing failed');
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to upload file');
+      setError(err instanceof Error ? err.message : 'Failed to process file');
+      setProcessingStatus("");
     } finally {
-      setIsUploading(false);
+      setIsProcessing(false);
     }
   };
 
-  const handleDownload = async (language: 'language1' | 'language2') => {
-    if (!currentJob) return;
+  const handleDownload = (language: 'language1' | 'language2', trackName: string) => {
+    if (!result) return;
 
     try {
-      const response = await fetch(`/api/download/${currentJob.jobId}`);
-      if (response.ok) {
-        const data = await response.json();
-        const url = data.urls[language];
-
-        // Open download URL in new tab
-        window.open(url, '_blank');
+      // Convert base64 to blob
+      const base64Data = language === 'language1' ? result.language1 : result.language2;
+      const byteCharacters = atob(base64Data);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
       }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: 'audio/mpeg' });
+
+      // Create download link
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${trackName}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (err) {
       console.error('Failed to download file:', err);
       setError('Failed to download file');
@@ -124,10 +121,15 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Upload Status */}
-        {isUploading && (
+        {/* Processing Status */}
+        {(isProcessing || processingStatus) && (
           <div className="flex-shrink-0 text-center mt-4">
-            <p className="text-sm text-neutral-600">Uploading...</p>
+            <p className="text-sm text-neutral-600">{processingStatus}</p>
+            {isProcessing && (
+              <div className="mt-2">
+                <div className="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-neutral-700"></div>
+              </div>
+            )}
           </div>
         )}
 
@@ -138,42 +140,27 @@ export default function Home() {
           </div>
         )}
 
-        {/* Processing Status */}
-        {currentJob && (
+        {/* Download Results */}
+        {result && (
           <div className="flex-shrink-0 text-center mt-4 max-w-xl mx-auto">
             <div className="bg-white dark:bg-neutral-900 rounded-lg p-4 shadow-sm">
-              <p className="text-sm font-semibold text-neutral-700 dark:text-neutral-300 mb-2">
-                {currentJob.status === 'pending' && 'Processing starting...'}
-                {currentJob.status === 'processing' && 'Separating audio tracks...'}
-                {currentJob.status === 'completed' && 'Processing complete!'}
-                {currentJob.status === 'failed' && 'Processing failed'}
+              <p className="text-sm font-semibold text-neutral-700 dark:text-neutral-300 mb-4">
+                Audio separation complete! Download your tracks:
               </p>
-
-              {currentJob.progress !== undefined && (
-                <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
-                  <div
-                    className="bg-green-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${currentJob.progress}%` }}
-                  />
-                </div>
-              )}
-
-              {currentJob.status === 'completed' && currentJob.outputFiles && (
-                <div className="flex gap-2 justify-center mt-4">
-                  <button
-                    onClick={() => handleDownload('language1')}
-                    className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
-                  >
-                    Download Track 1
-                  </button>
-                  <button
-                    onClick={() => handleDownload('language2')}
-                    className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
-                  >
-                    Download Track 2
-                  </button>
-                </div>
-              )}
+              <div className="flex gap-2 justify-center">
+                <button
+                  onClick={() => handleDownload('language1', 'language1_track')}
+                  className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
+                >
+                  Download Track 1
+                </button>
+                <button
+                  onClick={() => handleDownload('language2', 'language2_track')}
+                  className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
+                >
+                  Download Track 2
+                </button>
+              </div>
             </div>
           </div>
         )}
