@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { SimpleTree } from "@/components/ui/simple-growth-tree";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -155,10 +156,19 @@ export default function Home() {
     >
       {/* Header */}
       <header className="flex-shrink-0 pt-6 pb-10 px-6">
-        <h1 className="text-2xl font-bold text-neutral-700 dark:text-neutral-300">
-          Interpret
-        </h1>
-        <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-1">
+        <div className="flex items-center gap-2">
+          <Image
+            src="/logo.png"
+            alt="Interpret Logo"
+            width={42}
+            height={42}
+            className="flex-shrink-0"
+          />
+          <h1 className="text-2xl font-bold text-neutral-700 dark:text-neutral-300">
+            Interpret
+          </h1>
+        </div>
+        <p className="text-sm text-neutral-500 dark:text-neutral-900 mt-2">
           Split bilingual sermons into two clean one language audio tracks
         </p>
       </header>
@@ -254,7 +264,7 @@ export default function Home() {
           </div>
         )}
         {/* Tree Component */}
-        <div className="flex-1 min-h-0 relative">
+        <div className="hidden md:flex flex-1 min-h-0 relative">
           <SimpleTree />
         </div>
 
