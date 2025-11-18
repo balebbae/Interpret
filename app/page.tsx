@@ -85,7 +85,8 @@ export default function Home() {
           if (!line.trim()) continue;
 
           // Parse SSE format: "event: type\ndata: {...}"
-          const eventMatch = line.match(/event: (\w+)\ndata: (.+)/s);
+          // Use a character class instead of the dotAll (/s) flag for broader TS target compatibility
+          const eventMatch = line.match(/event: (\w+)\ndata: ([\s\S]+)/);
           if (!eventMatch) continue;
 
           const [, eventType, dataStr] = eventMatch;
