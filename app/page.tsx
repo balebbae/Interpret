@@ -189,6 +189,7 @@ export default function Home() {
               />
               <Button
                 type="submit"
+                className="cursor-pointer"
                 disabled={isProcessing || !youtubeUrl.trim()}
               >
                 {isProcessing ? 'Processing...' : 'Separate'}
