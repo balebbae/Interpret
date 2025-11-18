@@ -87,12 +87,44 @@ The core separation happens in `run-service/modal_app.py`:
 
    Copy the web endpoint URL to your `.env.local`.
 
-4. **Run development server**:
+4. **Setup YouTube cookies** (Required for YouTube downloads):
+
+   YouTube now requires authentication to prevent bot detection. Export your browser cookies:
+
+   **Option A: Using Browser Extension (Recommended)**
+   - Install "Get cookies.txt LOCALLY" extension ([Chrome](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) / [Firefox](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/))
+   - Go to [youtube.com](https://youtube.com) and sign in
+   - Click the extension icon → Export cookies
+   - Save the content
+
+   **Option B: Using yt-dlp**
+   ```bash
+   yt-dlp --cookies-from-browser chrome --cookies cookies.txt https://youtube.com
+   cat cookies.txt  # Copy the content
+   ```
+
+   **Create Modal secret:**
+   ```bash
+   modal secret create youtube-cookies YOUTUBE_COOKIES="$(cat cookies.txt)"
+   ```
+
+   Or manually:
+   ```bash
+   modal secret create youtube-cookies
+   # When prompted, paste: YOUTUBE_COOKIES=<paste cookie content>
+   ```
+
+   **Redeploy** after adding the secret:
+   ```bash
+   modal deploy modal_app.py
+   ```
+
+5. **Run development server**:
    ```bash
    npm run dev
    ```
 
-5. **Open browser**:
+6. **Open browser**:
    Visit [http://localhost:3000](http://localhost:3000)
 
 ## Project Structure

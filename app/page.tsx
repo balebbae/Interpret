@@ -1,7 +1,11 @@
 "use client";
 
 import { SimpleTree } from "@/components/ui/simple-growth-tree";
-import { FileUpload } from "@/components/ui/file-upload";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent } from "@/components/ui/card";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Loader2 } from "lucide-react";
 import { useState } from "react";
 
 interface ProcessingResult {
@@ -14,69 +18,101 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ProcessingResult | null>(null);
   const [processingStatus, setProcessingStatus] = useState<string>("");
+  const [progress, setProgress] = useState<number>(0);
+  const [youtubeUrl, setYoutubeUrl] = useState<string>("");
 
-  const handleFileUpload = async (files: File[]) => {
-    if (files.length === 0) return;
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!youtubeUrl.trim()) {
+      setError('Please enter a YouTube URL');
+      return;
+    }
 
     setIsProcessing(true);
     setError(null);
     setResult(null);
-    setProcessingStatus("Processing audio... This may take several minutes for long files.");
+    setProgress(0);
+    setProcessingStatus("Initializing...");
 
     try {
-      // Validate file type
-      const file = files[0];
-      if (!file.type.includes('audio/mpeg') && !file.name.endsWith('.mp3')) {
-        throw new Error('Invalid file type. Only MP3 files are allowed.');
+      // Validate YouTube URL format
+      const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|live\/)|youtu\.be\/)[\w-]+/;
+      if (!youtubeRegex.test(youtubeUrl)) {
+        throw new Error('Invalid YouTube URL. Please enter a valid YouTube link.');
       }
 
-      // Convert file to base64
-      setProcessingStatus("Preparing audio file...");
-      const arrayBuffer = await file.arrayBuffer();
-      const base64 = btoa(
-        new Uint8Array(arrayBuffer).reduce(
-          (data, byte) => data + String.fromCharCode(byte),
-          ''
-        )
-      );
-
-      // Call Modal directly (bypasses Vercel size limits)
-      setProcessingStatus("Sending to GPU for processing... This may take several minutes.");
       const modalEndpoint = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
-
       if (!modalEndpoint) {
         throw new Error('Modal endpoint not configured');
       }
 
+      // Use fetch with streaming for Server-Sent Events
       const response = await fetch(modalEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
         },
-        body: JSON.stringify({ audio_base64: base64 }),
+        body: JSON.stringify({ youtube_url: youtubeUrl }),
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Processing failed');
+        throw new Error('Failed to start processing');
       }
 
-      const data = await response.json();
-
-      if (data.language1 && data.language2) {
-        setResult({
-          language1: data.language1,
-          language2: data.language2,
-        });
-        setProcessingStatus("Processing complete!");
-      } else if (data.error) {
-        throw new Error(data.error);
-      } else {
-        throw new Error('Invalid response from server');
+      if (!response.body) {
+        throw new Error('No response body');
       }
+
+      // Read the SSE stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+
+        // Keep incomplete message in buffer
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          // Parse SSE format: "event: type\ndata: {...}"
+          const eventMatch = line.match(/event: (\w+)\ndata: (.+)/s);
+          if (!eventMatch) continue;
+
+          const [, eventType, dataStr] = eventMatch;
+          const data = JSON.parse(dataStr);
+
+          if (eventType === 'progress') {
+            setProgress(data.progress);
+            setProcessingStatus(data.message);
+          } else if (eventType === 'complete') {
+            setResult({
+              language1: data.language1,
+              language2: data.language2,
+            });
+            setProgress(100);
+            setProcessingStatus("Processing complete!");
+            setIsProcessing(false);
+            break;
+          } else if (eventType === 'error') {
+            throw new Error(data.message);
+          }
+        }
+      }
+
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to process file');
+      setError(err instanceof Error ? err.message : 'Failed to process video');
       setProcessingStatus("");
+      setProgress(0);
     } finally {
       setIsProcessing(false);
     }
@@ -127,33 +163,55 @@ export default function Home() {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col px-6 overflow-hidden">
-        {/* YouTube Link Input */}
-        {/* <div className="flex-shrink-0 mb-2">
-          <Input
-            type="url"
-            placeholder="Insert YouTube link"
-            value={youtubeLink}
-            onChange={(e) => setYoutubeLink(e.target.value)}
-            className="max-w-xl mx-auto"
-          />
-        </div> */}
-
-    
-        {/* File Upload */}
+      <main className="flex-1 flex flex-col p-6 overflow-hidden">
+        {/* YouTube URL Input Form */}
         <div className="flex-shrink-0">
-          <div className="max-w-xl mx-auto">
-            <FileUpload onChange={handleFileUpload} />
-          </div>
+          <form onSubmit={handleSubmit} className="max-w-xl mx-auto">
+            <div className="flex gap-2">
+              <Input
+                type="url"
+                placeholder="Paste YouTube link here..."
+                value={youtubeUrl}
+                onChange={(e) => setYoutubeUrl(e.target.value)}
+                disabled={isProcessing}
+                className="flex-1"
+              />
+              <Button
+                type="submit"
+                disabled={isProcessing || !youtubeUrl.trim()}
+              >
+                {isProcessing ? 'Processing...' : 'Separate'}
+              </Button>
+            </div>
+            <p className="text-xs text-neutral-500 mt-2">
+              Supports youtube.com and youtu.be URLs
+            </p>
+          </form>
         </div>
 
         {/* Processing Status */}
         {(isProcessing || processingStatus) && (
-          <div className="flex-shrink-0 text-center mt-4">
-            <p className="text-sm text-neutral-600">{processingStatus}</p>
+          <div className="flex-shrink-0 mt-4 max-w-xl mx-auto w-full px-6">
+            {/* Progress Bar */}
             {isProcessing && (
-              <div className="mt-2">
-                <div className="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-neutral-700"></div>
+              <div className="mb-3">
+                <div className="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
+                  <div
+                    className="bg-blue-600 h-2.5 rounded-full transition-all duration-300 ease-out"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+                <div className="flex justify-between mt-1 text-xs text-neutral-500">
+                  <span>{progress}%</span>
+                  <span>{progress < 25 ? 'Downloading' : progress < 45 ? 'Loading' : progress < 80 ? 'Processing' : progress < 95 ? 'Building' : 'Finalizing'}</span>
+                </div>
+              </div>
+            )}
+            {/* Status Message */}
+            <p className="text-sm text-neutral-600 text-center">{processingStatus}</p>
+            {isProcessing && (
+              <div className="mt-2 text-center">
+                <Loader2 className="inline-block h-6 w-6 animate-spin text-neutral-700" />
               </div>
             )}
           </div>
@@ -161,35 +219,43 @@ export default function Home() {
 
         {/* Error Message */}
         {error && (
-          <div className="flex-shrink-0 text-center mt-4">
-            <p className="text-sm text-red-600">{error}</p>
+          <div className="flex-shrink-0 mt-4 max-w-xl mx-auto">
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
           </div>
         )}
 
         {/* Download Results */}
         {result && (
           <div className="flex-shrink-0 text-center mt-4 max-w-xl mx-auto">
-            <div className="bg-white dark:bg-neutral-900 rounded-lg p-4 shadow-sm">
-              <p className="text-sm font-semibold text-neutral-700 dark:text-neutral-300 mb-4">
-                Audio separation complete! Download your tracks:
-              </p>
-              <div className="flex gap-2 justify-center">
-                <button
-                  onClick={() => handleDownload('language1', 'language1_track')}
-                  className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
-                >
-                  Download Track 1
-                </button>
-                <button
-                  onClick={() => handleDownload('language2', 'language2_track')}
-                  className="px-4 py-2 bg-neutral-700 text-white rounded-md text-sm hover:bg-neutral-800 transition-colors"
-                >
-                  Download Track 2
-                </button>
-              </div>
-            </div>
+            <Card>
+              <CardContent className="">
+                <p className="text-sm text-neutral-700 dark:text-neutral-300 mb-4">
+                  Audio separation complete! Download your tracks:
+                </p>
+                <div className="flex gap-2 justify-center">
+                  <Button
+                    onClick={() => handleDownload('language1', 'language1_track')}
+                    variant="default"
+                  >
+                    Download Track 1
+                  </Button>
+                  <Button
+                    onClick={() => handleDownload('language2', 'language2_track')}
+                    variant="default"
+                  >
+                    Download Track 2
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
           </div>
         )}
+        {/* Tree Component */}
+        <div className="flex-1 min-h-0 relative">
+          <SimpleTree />
+        </div>
 
         {/* Bible Verse */}
         <div className="flex-shrink-0 text-center p-15">
@@ -201,10 +267,7 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Tree Component */}
-        <div className="flex-1 min-h-0 mb-2 relative">
-          <SimpleTree />
-        </div>
+        
       </main>
     </div>
   );
