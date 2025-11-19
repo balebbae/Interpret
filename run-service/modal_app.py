@@ -457,7 +457,7 @@ class AudioSeparator:
                                 print(f"[EventGenerator] Yielding progress: {current_percent:.1f}% (overall: {overall_progress}%)")
                                 yield send_event("progress", {
                                     "stage": "download",
-                                    "message": f"Downloading: {current_percent:.0f}%{speed_str}",
+                                    "message": f"Extracting audio: {current_percent:.0f}%{speed_str}",
                                     "progress": overall_progress
                                 })
 
@@ -504,7 +504,7 @@ class AudioSeparator:
                     # 3. Run diarization (longest step)
                     yield send_event("progress", {
                         "stage": "diarization",
-                        "message": "Running AI speaker separation (this takes longest)...",
+                        "message": "Running AI speaker separation...",
                         "progress": 45
                     })
                     await asyncio.sleep(0)  # Flush event

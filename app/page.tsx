@@ -174,7 +174,7 @@ export default function Home() {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col p-6 overflow-hidden">
+      <main className="flex-1 flex flex-col px-6 py-4 overflow-hidden">
         {/* YouTube URL Input Form */}
         <div className="flex-shrink-0">
           <form onSubmit={handleSubmit} className="max-w-xl mx-auto">
@@ -185,11 +185,11 @@ export default function Home() {
                 value={youtubeUrl}
                 onChange={(e) => setYoutubeUrl(e.target.value)}
                 disabled={isProcessing}
-                className="flex-1"
+                className="flex-1 shadow-none"
               />
               <Button
                 type="submit"
-                className="cursor-pointer"
+                className="cursor-pointer rounded-em"
                 disabled={isProcessing || !youtubeUrl.trim()}
               >
                 {isProcessing ? 'Processing...' : 'Separate'}
@@ -222,7 +222,7 @@ export default function Home() {
             {/* Status Message */}
             <p className="text-sm text-neutral-600 text-center">{processingStatus}</p>
             {isProcessing && (
-              <div className="mt-2 text-center">
+              <div className="mt-3 text-center">
                 <Loader2 className="inline-block h-6 w-6 animate-spin text-neutral-700" />
               </div>
             )}
@@ -241,8 +241,8 @@ export default function Home() {
         {/* Download Results */}
         {result && (
           <div className="flex-shrink-0 text-center mt-4 max-w-xl mx-auto">
-            <Card>
-              <CardContent className="">
+            <Card className="rounded-md shadow-none">
+              <CardContent >
                 <p className="text-sm text-neutral-700 dark:text-neutral-300 mb-4">
                   Audio separation complete! Download your tracks:
                 </p>
@@ -250,12 +250,14 @@ export default function Home() {
                   <Button
                     onClick={() => handleDownload('language1', 'language1_track')}
                     variant="default"
+                    className="cursor-pointer rounded-sm"
                   >
                     Download Track 1
                   </Button>
                   <Button
                     onClick={() => handleDownload('language2', 'language2_track')}
                     variant="default"
+                    className="cursor-pointer rounded-sm"
                   >
                     Download Track 2
                   </Button>
@@ -265,13 +267,13 @@ export default function Home() {
           </div>
         )}
         {/* Tree Component */}
-        <div className="hidden md:flex flex-1 min-h-0 relative">
+        <div className="flex flex-1 min-h-0 relative">
           <SimpleTree />
         </div>
 
         {/* Bible Verse */}
-        <div className="flex-shrink-0 text-center p-15">
-          <p className="text-sm text-neutral-600 dark:text-neutral-400 max-w-2xl mx-auto leading-relaxed">
+        <div className="flex-shrink-0 text-center mb-8 pt-2">
+          <p className="text-sm text-neutral-600 dark:text-neutral-400 max-w-3xl mx-auto leading-relaxed">
             <span className="font-semibold">20</span> But know this first of all, that no prophecy of Scripture becomes a matter of someone's own interpretation, <span className="font-semibold">21</span> for no prophecy was ever made by an act of human will, but men moved by the Holy Spirit spoke from God.
           </p>
           <p className="text-xs text-neutral-500 dark:text-neutral-500 mt-1">
