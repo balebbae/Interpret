@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Interpret is a bilingual audio separator web app that splits sermons with interpretation into two separate language tracks using AI-powered speaker diarization. Users provide a YouTube URL, and the app downloads the audio, separates speakers, and provides two downloadable MP3 files.
+Interpret is a bilingual audio separator web app that splits sermons with interpretation into two separate language tracks using AI-powered speaker diarization. Users provide a YouTube URL or upload an MP3 file; the app obtains the audio, separates speakers, and provides two downloadable MP3 files.
 
 ## Common Commands
 
@@ -18,15 +18,16 @@ npm run lint     # Run ESLint
 cd run-service
 modal deploy modal_app.py                              # Deploy to Modal
 modal run modal_app.py -- <youtube_url>                # Test locally with YouTube URL
+modal run modal_app.py -- ./sermon.mp3                 # Test locally with an MP3 file
 modal secret create youtube-cookies YOUTUBE_COOKIES="$(cat cookies.txt)"  # Required for YouTube downloads
 ```
 
 ## Architecture
 
 **Frontend (Next.js 16 + React 19):**
-- Single-page app with YouTube URL input
+- Single-page app with two input modes: YouTube URL or MP3 file upload (react-dropzone)
 - Direct communication with Modal GPU endpoint via Server-Sent Events (SSE)
-- Real-time progress tracking (download → preprocessing → diarization → export)
+- Real-time progress tracking (download/upload → preprocessing → diarization → export)
 - Results are base64-decoded client-side for download
 
 **Backend Processing (Modal Serverless GPU):**
@@ -36,9 +37,9 @@ modal secret create youtube-cookies YOUTUBE_COOKIES="$(cat cookies.txt)"  # Requ
 - Assigns speakers to tracks based on total speaking duration (longer = track 1)
 
 **Data Flow:**
-1. User submits YouTube URL → validated client-side
-2. POST request sent to Modal endpoint with `{youtube_url: string}`
-3. Modal downloads audio via yt-dlp (requires YouTube cookies for authentication)
+1. User submits YouTube URL (validated client-side) or selects an MP3 file (base64-encoded in browser)
+2. POST request sent to Modal endpoint with `{youtube_url: string}` or `{audio_base64: string}` (exactly one)
+3. Modal downloads audio via yt-dlp (requires YouTube cookies for authentication), or decodes the uploaded base64 to disk
 4. Audio preprocessing: convert to mono, resample to 16kHz, normalize
 5. Speaker diarization with pyannote.audio (FP16 mixed precision, batch size 64)
 6. Build two tracks by concatenating segments per speaker
@@ -57,7 +58,7 @@ modal secret create youtube-cookies YOUTUBE_COOKIES="$(cat cookies.txt)"  # Requ
 ### Real-Time Progress (Server-Sent Events)
 - Frontend uses `fetch()` with `Accept: text/event-stream` header
 - Modal streams SSE events: `progress`, `complete`, `error`
-- Progress stages: download (0-25%), preprocess (30-40%), diarization (45-75%), build (80%), export (90-95%), encode (95-100%)
+- Progress stages: download/upload (0-25%), preprocess (30-40%), diarization (45-75%), build (80%), export (90-95%), encode (95-100%)
 - `DownloadProgress` class provides thread-safe progress tracking during YouTube download
 
 ### Speaker Diarization Pipeline
@@ -83,7 +84,7 @@ YOUTUBE_COOKIES=<netscape_cookie_format>                          # Modal secret
 
 ## Important Files
 
-- `app/page.tsx` - Main UI with YouTube URL input, SSE handling, progress display, download logic
+- `app/page.tsx` - Main UI with YouTube URL / MP3 upload input, SSE handling, progress display, download logic
 - `run-service/modal_app.py` - GPU processing service with AudioSeparator class and SSE streaming
 - `lib/types.ts` - TypeScript interfaces for requests/responses
 - `components/ui/simple-growth-tree.tsx` - Animated tree visualization (decorative)

@@ -6,13 +6,34 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2 } from "lucide-react";
-import { useState } from "react";
+import { Loader2, Upload, X } from "lucide-react";
+import { useCallback, useState } from "react";
+import { useDropzone, type FileRejection } from "react-dropzone";
+import type { SeparationRequest } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface ProcessingResult {
   language1: string; // Base64 encoded MP3
   language2: string; // Base64 encoded MP3
 }
+
+type InputMode = "youtube" | "upload";
+
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+const formatFileSize = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+
+// Reads via data URL so large files are encoded natively instead of byte-by-byte in JS
+const fileToBase64 = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      resolve(dataUrl.slice(dataUrl.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
 
 export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
@@ -21,12 +42,51 @@ export default function Home() {
   const [processingStatus, setProcessingStatus] = useState<string>("");
   const [progress, setProgress] = useState<number>(0);
   const [youtubeUrl, setYoutubeUrl] = useState<string>("");
+  const [inputMode, setInputMode] = useState<InputMode>("youtube");
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+
+  const onDrop = useCallback((accepted: File[], rejections: FileRejection[]) => {
+    if (rejections.length > 0) {
+      const code = rejections[0].errors[0]?.code;
+      setError(
+        code === 'file-too-large'
+          ? `File is too large. Maximum size is ${formatFileSize(MAX_UPLOAD_BYTES)}.`
+          : 'Only MP3 files are supported.'
+      );
+      return;
+    }
+    if (accepted[0]) {
+      setAudioFile(accepted[0]);
+      setError(null);
+      setResult(null);
+    }
+  }, []);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    multiple: false,
+    accept: { 'audio/mpeg': ['.mp3'] },
+    maxSize: MAX_UPLOAD_BYTES,
+    disabled: isProcessing,
+  });
+
+  const switchMode = (mode: InputMode) => {
+    if (isProcessing) return;
+    setInputMode(mode);
+    setError(null);
+  };
+
+  const canSubmit = inputMode === 'youtube' ? youtubeUrl.trim().length > 0 : audioFile !== null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!youtubeUrl.trim()) {
+    if (inputMode === 'youtube' && !youtubeUrl.trim()) {
       setError('Please enter a YouTube URL');
+      return;
+    }
+    if (inputMode === 'upload' && !audioFile) {
+      setError('Please select an MP3 file');
       return;
     }
 
@@ -37,10 +97,22 @@ export default function Home() {
     setProcessingStatus("Initializing...");
 
     try {
-      // Validate YouTube URL format
-      const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|live\/)|youtu\.be\/)[\w-]+/;
-      if (!youtubeRegex.test(youtubeUrl)) {
-        throw new Error('Invalid YouTube URL. Please enter a valid YouTube link.');
+      let requestBody: SeparationRequest;
+
+      if (inputMode === 'youtube') {
+        // Validate YouTube URL format
+        const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|live\/)|youtu\.be\/)[\w-]+/;
+        if (!youtubeRegex.test(youtubeUrl)) {
+          throw new Error('Invalid YouTube URL. Please enter a valid YouTube link.');
+        }
+        requestBody = { youtube_url: youtubeUrl };
+      } else {
+        if (!audioFile) {
+          throw new Error('Please select an MP3 file');
+        }
+        setProcessingStatus("Reading audio file...");
+        requestBody = { audio_base64: await fileToBase64(audioFile) };
+        setProcessingStatus(`Uploading ${formatFileSize(audioFile.size)}...`);
       }
 
       const modalEndpoint = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
@@ -55,7 +127,7 @@ export default function Home() {
           'Content-Type': 'application/json',
           'Accept': 'text/event-stream',
         },
-        body: JSON.stringify({ youtube_url: youtubeUrl }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
@@ -112,7 +184,7 @@ export default function Home() {
       }
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to process video');
+      setError(err instanceof Error ? err.message : 'Failed to process audio');
       setProcessingStatus("");
       setProgress(0);
     } finally {
@@ -175,28 +247,97 @@ export default function Home() {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col px-6 py-4 overflow-hidden">
-        {/* YouTube URL Input Form */}
+        {/* Input Form */}
         <div className="flex-shrink-0">
           <form onSubmit={handleSubmit} className="max-w-xl mx-auto">
-            <div className="flex gap-2">
-              <Input
-                type="url"
-                placeholder="Paste YouTube link here..."
-                value={youtubeUrl}
-                onChange={(e) => setYoutubeUrl(e.target.value)}
+            <div className="flex gap-1 mb-2" role="tablist" aria-label="Audio source">
+              <Button
+                type="button"
+                role="tab"
+                aria-selected={inputMode === 'youtube'}
+                size="sm"
+                variant={inputMode === 'youtube' ? 'secondary' : 'ghost'}
+                className="cursor-pointer"
                 disabled={isProcessing}
-                className="flex-1 shadow-none"
-              />
+                onClick={() => switchMode('youtube')}
+              >
+                YouTube link
+              </Button>
+              <Button
+                type="button"
+                role="tab"
+                aria-selected={inputMode === 'upload'}
+                size="sm"
+                variant={inputMode === 'upload' ? 'secondary' : 'ghost'}
+                className="cursor-pointer"
+                disabled={isProcessing}
+                onClick={() => switchMode('upload')}
+              >
+                Upload MP3
+              </Button>
+            </div>
+
+            <div className="flex gap-2">
+              {inputMode === 'youtube' ? (
+                <Input
+                  type="url"
+                  placeholder="Paste YouTube link here..."
+                  value={youtubeUrl}
+                  onChange={(e) => setYoutubeUrl(e.target.value)}
+                  disabled={isProcessing}
+                  className="flex-1 shadow-none"
+                />
+              ) : (
+                <div
+                  {...getRootProps({
+                    className: cn(
+                      "flex-1 min-w-0 flex items-center gap-2 h-9 px-3 rounded-md border border-dashed text-sm transition-colors",
+                      isProcessing ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:border-neutral-400",
+                      isDragActive ? "border-blue-500 bg-blue-50" : "border-input bg-transparent"
+                    ),
+                  })}
+                >
+                  <input {...getInputProps()} />
+                  <Upload className="h-4 w-4 flex-shrink-0 text-neutral-500" />
+                  {audioFile ? (
+                    <>
+                      <span className="truncate text-neutral-700">{audioFile.name}</span>
+                      <span className="flex-shrink-0 text-xs text-neutral-500">
+                        {formatFileSize(audioFile.size)}
+                      </span>
+                      {!isProcessing && (
+                        <button
+                          type="button"
+                          aria-label="Remove file"
+                          className="ml-auto flex-shrink-0 cursor-pointer text-neutral-400 hover:text-neutral-700"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setAudioFile(null);
+                          }}
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <span className="truncate text-neutral-500">
+                      {isDragActive ? 'Drop MP3 here...' : 'Drop an MP3 here or click to browse'}
+                    </span>
+                  )}
+                </div>
+              )}
               <Button
                 type="submit"
                 className="cursor-pointer rounded-em"
-                disabled={isProcessing || !youtubeUrl.trim()}
+                disabled={isProcessing || !canSubmit}
               >
                 {isProcessing ? 'Processing...' : 'Separate'}
               </Button>
             </div>
             <p className="text-xs text-neutral-500 mt-2">
-              Supports youtube.com and youtu.be URLs
+              {inputMode === 'youtube'
+                ? 'Supports youtube.com and youtu.be URLs'
+                : `MP3 files up to ${formatFileSize(MAX_UPLOAD_BYTES)}`}
             </p>
           </form>
         </div>
@@ -215,7 +356,7 @@ export default function Home() {
                 </div>
                 <div className="flex justify-between mt-1 text-xs text-neutral-500">
                   <span>{progress}%</span>
-                  <span>{progress < 25 ? 'Downloading' : progress < 45 ? 'Loading' : progress < 80 ? 'Processing' : progress < 95 ? 'Building' : 'Finalizing'}</span>
+                  <span>{progress < 25 ? (inputMode === 'youtube' ? 'Downloading' : 'Uploading') : progress < 45 ? 'Loading' : progress < 80 ? 'Processing' : progress < 95 ? 'Building' : 'Finalizing'}</span>
                 </div>
               </div>
             )}
