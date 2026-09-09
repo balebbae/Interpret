@@ -88,6 +88,11 @@ The core separation happens in `run-service/modal_app.py`:
 
    Copy the web endpoint URL to your `.env.local`.
 
+   **Automatic deploys:** `.github/workflows/modal-deploy.yml` runs `modal deploy` whenever a
+   push to `main` touches `run-service/` (or manually via *Actions → Deploy Modal service → Run
+   workflow*). Add `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` as repository Actions secrets
+   (create a token at https://modal.com/settings/tokens).
+
    To test the service without the frontend:
    ```bash
    modal run modal_app.py --path ./sermon.mp3 --out-dir ./out

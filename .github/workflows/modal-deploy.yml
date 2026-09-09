@@ -1,0 +1,34 @@
+name: Deploy Modal service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "run-service/**"
+  workflow_dispatch:
+
+concurrency:
+  group: modal-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: run-service
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install modal
+
+      - run: python -m py_compile modal_app.py
+
+      - run: modal deploy modal_app.py
