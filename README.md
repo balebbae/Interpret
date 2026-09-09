@@ -4,17 +4,17 @@ A web application for splitting bilingual sermons into two clean language-only a
 
 ## Overview
 
-Interpret allows users to upload an MP3 file containing bilingual audio (e.g., sermons with interpretation) and automatically separates it into two clean audio tracks - one for each language. It uses AI-powered speaker diarization via pyannote.audio to identify and separate speakers.
+Interpret allows users to upload an MP3 file containing bilingual audio (e.g., sermons with interpretation) and automatically separates it into two clean audio tracks - one for each language. pyannote.audio speaker diarization finds *when* someone is speaking and where the turns change; Whisper's language-identification head decides *which language* each turn is in.
 
 ## How It Works
 
 ### High-Level Flow
 
 1. **Input**: User drops an MP3 file (browser converts it to base64)
-2. **Process**: Request sent directly to Modal GPU endpoint as `{audio_base64}`
-3. **Diarize**: pyannote.audio identifies 2 speakers via diarization
-4. **Separate**: Audio segments grouped by speaker (longer speaker = Track 1)
-5. **Return**: Two base64-encoded MP3s plus stage timings returned to browser
+2. **Process**: Request sent directly to Modal GPU endpoint as `{audio_base64, languages: ["en", "zh"]}` (languages optional)
+3. **Diarize**: pyannote.audio finds every speech turn
+4. **Identify**: Whisper labels each turn with its spoken language
+5. **Return**: Two base64-encoded MP3s (one per language) plus metadata and stage timings
 6. **Download**: Browser decodes and offers file downloads
 
 ### Audio Processing Pipeline (Modal GPU)
@@ -25,35 +25,40 @@ The core separation happens in `run-service/modal_app.py`:
    - One 16 kHz mono float32 copy, peak-normalised, for the diarization model
    - One mono int16 copy at the file's **native sample rate** for the output tracks (decoded in parallel with diarization)
 
-2. **Speaker Diarization** (pyannote.audio)
-   - Neural network identifies "who spoke when"
-   - Forces exactly 2 speaker clusters (`num_speakers=2`)
-   - Outputs timestamped segments: `[(0.5s, 3.2s, SPEAKER_00), (3.2s, 8.1s, SPEAKER_01), ...]`
-   - FP16 mixed precision, segmentation and embedding batch size 64
+2. **Speaker Diarization** (pyannote/speaker-diarization-3.1)
+   - Neural network identifies "who spoke when" with no constraint on the number of voices
+   - Outputs timestamped turns: `[(0.5s, 3.2s, SPEAKER_00), (3.2s, 8.1s, SPEAKER_01), ...]`
+   - Runs in FP32 (mixed precision corrupts the speaker embeddings), batch size 64
 
-3. **Timeline Clean-up**
+3. **Language Identification** (Whisper `small`)
+   - Turns are split into <= 20 s units; units shorter than 0.4 s are ignored
+   - Whisper's language head scores every unit; the scores are restricted to the two
+     requested languages (or, if none/one is given, to the two most-spoken languages in the file)
+   - Units the model is unsure about (< 0.8) take the language their voice speaks most in the
+     surrounding two minutes
+
+4. **Timeline Clean-up**
    - Drop segments shorter than 0.25 s (back-channels, glitches)
    - Pad every segment by 0.15 s so word edges are not clipped
-   - Merge same-speaker segments separated by less than 0.5 s
-
-4. **Speaker-to-Track Assignment**
-   - Calculate total speaking duration per speaker
-   - Speaker with **more total time** becomes Track 1
-   - Assumes both languages have roughly equal content
+   - Merge same-language segments separated by less than 0.5 s
 
 5. **Track Building**
    - Slice the native-rate audio for each segment and apply a 15 ms fade at every cut
-   - Concatenate all segments per speaker into continuous tracks
+   - Concatenate all segments per language into continuous tracks
 
 6. **MP3 Export**
    - Both tracks encoded in parallel with ffmpeg/libmp3lame at 128 kbps, at the native sample rate
 
-**Important**: The pipeline separates by **voice identity**, not by language detection. It assumes the two speakers are speaking different languages (e.g., original speaker + interpreter).
+**Why language, not voice?** Real recordings often have more than two voices (a second
+preacher, a change of interpreter, an announcer) and a diarizer clusters by *voice*, so
+"2 speakers = 2 languages" routes whole passages to the wrong track. Labelling each turn
+by language makes the number of speakers irrelevant. Overlapping speech (the interpreter
+starting before the preacher finishes) is included in both tracks.
 
 ## Architecture
 
 - **Frontend**: Next.js 16 with React 19, Tailwind CSS v4
-- **GPU Processing**: Modal serverless GPU (L4) with pyannote.audio speaker diarization
+- **GPU Processing**: Modal serverless GPU (L4) with pyannote.audio diarization + Whisper language ID
 - **Communication**: Direct client-to-Modal API
 
 ## Getting Started
@@ -90,7 +95,7 @@ The core separation happens in `run-service/modal_app.py`:
 
    To test the service without the frontend:
    ```bash
-   modal run modal_app.py --path ./sermon.mp3 --out-dir ./out
+   modal run modal_app.py --path ./sermon.mp3 --out-dir ./out --languages en,zh
    ```
 
 4. **Run development server**:
@@ -117,7 +122,7 @@ interpret/
 │   ├── types.ts                  # TypeScript interfaces
 │   └── utils.ts                  # General utilities (cn helper)
 ├── run-service/                  # Modal GPU service
-│   ├── modal_app.py              # AudioSeparator class with pyannote pipeline
+│   ├── modal_app.py              # AudioSeparator class: pyannote diarization + Whisper language ID
 │   └── requirements.txt          # Python dependencies
 └── .env.local                    # Local environment variables
 ```
@@ -135,6 +140,7 @@ interpret/
 - **Modal** - Serverless GPU platform
 - **Python 3.10** - Programming language
 - **pyannote.audio 3.1** - Speaker diarization
+- **openai-whisper** - Spoken-language identification
 - **PyTorch + CUDA** - GPU acceleration
 - **ffmpeg** - Audio decoding and MP3 export
 
