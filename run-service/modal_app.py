@@ -376,8 +376,9 @@ class AudioSeparator:
         """
         Process audio file and return separated language tracks using Server-Sent Events.
 
-        Expects JSON with:
+        Expects JSON with exactly one of:
         - youtube_url: YouTube video URL to download and process
+        - audio_base64: Base64-encoded MP3 file uploaded from the browser
 
         Returns SSE stream with:
         - progress events: Real-time progress updates (0-100%)
@@ -403,76 +404,109 @@ class AudioSeparator:
             try:
                 # Validate input
                 youtube_url = item.get("youtube_url")
-                if not youtube_url:
-                    yield send_event("error", {"message": "No youtube_url provided"})
+                audio_base64 = item.get("audio_base64")
+                if not youtube_url and not audio_base64:
+                    yield send_event("error", {"message": "Provide either youtube_url or audio_base64"})
+                    return
+                if youtube_url and audio_base64:
+                    yield send_event("error", {"message": "Provide only one of youtube_url or audio_base64"})
                     return
 
+                loop = asyncio.get_event_loop()
+
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    # 1. Download YouTube audio with real-time progress
-                    yield send_event("progress", {
-                        "stage": "download",
-                        "message": "Starting download...",
-                        "progress": 0
-                    })
-                    await asyncio.sleep(0)  # Flush event
-
                     input_path = os.path.join(tmpdir, "input.mp3")
-                    try:
-                        # Create progress tracker
-                        progress_tracker = DownloadProgress()
 
-                        # Run blocking download in thread pool to prevent blocking event loop
-                        loop = asyncio.get_event_loop()
-                        download_future = loop.run_in_executor(
-                            None,
-                            self._download_youtube_audio,
-                            youtube_url,
-                            input_path,
-                            progress_tracker
-                        )
+                    if audio_base64:
+                        # 1a. Decode uploaded audio
+                        yield send_event("progress", {
+                            "stage": "upload",
+                            "message": "Upload received, decoding audio...",
+                            "progress": 5
+                        })
+                        await asyncio.sleep(0)  # Flush event
 
-                        # Poll progress while downloading
-                        print("[EventGenerator] Starting progress polling loop...")
-                        last_percent = 0
-                        poll_count = 0
-                        while not download_future.done():
-                            await asyncio.sleep(0.5)  # Check every 500ms
-                            poll_count += 1
-
-                            # Thread-safe read of progress
-                            current_percent, speed = progress_tracker.get_progress()
-                            if poll_count % 10 == 0:  # Every 5 seconds
-                                print(f"[EventGenerator] Poll #{poll_count}: progress={current_percent:.1f}%, task_done={download_future.done()}")
-                            if current_percent > last_percent:
-                                last_percent = current_percent
-                                # Map 0-100% download progress to 0-25% overall progress
-                                overall_progress = int(current_percent * 0.25)
-
-                                # Format speed if available
-                                speed_str = ""
-                                if speed:
-                                    speed_mb = speed / (1024 * 1024)
-                                    speed_str = f" at {speed_mb:.1f}MB/s"
-
-                                print(f"[EventGenerator] Yielding progress: {current_percent:.1f}% (overall: {overall_progress}%)")
-                                yield send_event("progress", {
-                                    "stage": "download",
-                                    "message": f"Extracting audio: {current_percent:.0f}%{speed_str}",
-                                    "progress": overall_progress
-                                })
-
-                        # Wait for completion (in case it finished between checks)
-                        await download_future
+                        try:
+                            size_mb = await loop.run_in_executor(
+                                None,
+                                self._write_uploaded_audio,
+                                audio_base64,
+                                input_path
+                            )
+                        except ValueError as e:
+                            yield send_event("error", {"message": str(e)})
+                            return
 
                         yield send_event("progress", {
-                            "stage": "download",
-                            "message": "Download complete!",
+                            "stage": "upload",
+                            "message": f"Received {size_mb:.1f} MB of audio",
                             "progress": 25
                         })
                         await asyncio.sleep(0)  # Flush event
-                    except RuntimeError as e:
-                        yield send_event("error", {"message": str(e)})
-                        return
+                    else:
+                        # 1b. Download YouTube audio with real-time progress
+                        yield send_event("progress", {
+                            "stage": "download",
+                            "message": "Starting download...",
+                            "progress": 0
+                        })
+                        await asyncio.sleep(0)  # Flush event
+
+                        try:
+                            # Create progress tracker
+                            progress_tracker = DownloadProgress()
+
+                            # Run blocking download in thread pool to prevent blocking event loop
+                            download_future = loop.run_in_executor(
+                                None,
+                                self._download_youtube_audio,
+                                youtube_url,
+                                input_path,
+                                progress_tracker
+                            )
+
+                            # Poll progress while downloading
+                            print("[EventGenerator] Starting progress polling loop...")
+                            last_percent = 0
+                            poll_count = 0
+                            while not download_future.done():
+                                await asyncio.sleep(0.5)  # Check every 500ms
+                                poll_count += 1
+
+                                # Thread-safe read of progress
+                                current_percent, speed = progress_tracker.get_progress()
+                                if poll_count % 10 == 0:  # Every 5 seconds
+                                    print(f"[EventGenerator] Poll #{poll_count}: progress={current_percent:.1f}%, task_done={download_future.done()}")
+                                if current_percent > last_percent:
+                                    last_percent = current_percent
+                                    # Map 0-100% download progress to 0-25% overall progress
+                                    overall_progress = int(current_percent * 0.25)
+
+                                    # Format speed if available
+                                    speed_str = ""
+                                    if speed:
+                                        speed_mb = speed / (1024 * 1024)
+                                        speed_str = f" at {speed_mb:.1f}MB/s"
+
+                                    print(f"[EventGenerator] Yielding progress: {current_percent:.1f}% (overall: {overall_progress}%)")
+                                    yield send_event("progress", {
+                                        "stage": "download",
+                                        "message": f"Extracting audio: {current_percent:.0f}%{speed_str}",
+                                        "progress": overall_progress
+                                    })
+
+                            # Wait for completion (in case it finished between checks)
+                            await download_future
+
+                            yield send_event("progress", {
+                                "stage": "download",
+                                "message": "Download complete!",
+                                "progress": 25
+                            })
+                            await asyncio.sleep(0)  # Flush event
+                        except RuntimeError as e:
+                            yield send_event("error", {"message": str(e)})
+                            return
 
                     print("Starting optimized audio processing...")
                     total_start = time.time()
@@ -619,6 +653,29 @@ class AudioSeparator:
             }
         )
 
+    def _write_uploaded_audio(self, audio_base64: str, output_path: str) -> float:
+        """Decode a base64 MP3 upload to disk. Returns size in MB."""
+        import binascii
+
+        # Tolerate a data URL prefix ("data:audio/mpeg;base64,...")
+        if audio_base64.startswith("data:"):
+            audio_base64 = audio_base64.split(",", 1)[-1]
+
+        try:
+            audio_bytes = base64.b64decode(audio_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("audio_base64 is not valid base64 data")
+
+        if not audio_bytes:
+            raise ValueError("Uploaded audio file is empty")
+
+        with open(output_path, "wb") as f:
+            f.write(audio_bytes)
+
+        size_mb = len(audio_bytes) / (1024 * 1024)
+        print(f"Wrote uploaded audio: {size_mb:.1f} MB -> {output_path}")
+        return size_mb
+
     def _load_and_preprocess_audio(self, input_path: str, target_sr: int = 16000):
         """Load and preprocess audio using torchaudio (faster than pydub)."""
         import torchaudio
@@ -756,18 +813,25 @@ class AudioSeparator:
 # Optional: Local entrypoint for testing
 @app.local_entrypoint()
 def main():
-    """Test the audio separator locally with a YouTube URL."""
+    """Test the audio separator locally with a YouTube URL or a local MP3 path."""
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: modal run modal_app.py -- <youtube_url>")
+        print("Usage: modal run modal_app.py -- <youtube_url | path/to/file.mp3>")
         print("Example: modal run modal_app.py -- https://www.youtube.com/watch?v=VIDEO_ID")
+        print("Example: modal run modal_app.py -- ./sermon.mp3")
         return
 
-    youtube_url = sys.argv[1]
+    source = sys.argv[1]
+
+    if os.path.isfile(source):
+        with open(source, "rb") as f:
+            request = {"audio_base64": base64.b64encode(f.read()).decode("utf-8")}
+    else:
+        request = {"youtube_url": source}
 
     separator = AudioSeparator()
-    result = separator.separate.remote({"youtube_url": youtube_url})
+    result = separator.separate.remote(request)
 
     if "error" in result:
         print(f"Error: {result['error']}")

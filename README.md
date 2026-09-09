@@ -4,14 +4,14 @@ A web application for splitting bilingual sermons into two clean language-only a
 
 ## Overview
 
-Interpret allows users to upload MP3 files containing bilingual audio (e.g., sermons with interpretation) and automatically separates them into two clean audio tracks - one for each language. It uses AI-powered speaker diarization via pyannote.audio to identify and separate speakers.
+Interpret allows users to paste a YouTube link or upload an MP3 file containing bilingual audio (e.g., sermons with interpretation) and automatically separates them into two clean audio tracks - one for each language. It uses AI-powered speaker diarization via pyannote.audio to identify and separate speakers.
 
 ## How It Works
 
 ### High-Level Flow
 
-1. **Upload**: User drops MP3 file, browser converts to base64
-2. **Process**: Base64 sent directly to Modal GPU endpoint
+1. **Input**: User pastes a YouTube URL, or drops an MP3 file (browser converts it to base64)
+2. **Process**: Request sent directly to Modal GPU endpoint (`youtube_url` or `audio_base64`); YouTube audio is downloaded with yt-dlp
 3. **Diarize**: pyannote.audio identifies 2 speakers via diarization
 4. **Separate**: Audio segments grouped by speaker (longer speaker = Track 1)
 5. **Return**: Two base64-encoded MP3s returned to browser
@@ -132,12 +132,11 @@ The core separation happens in `run-service/modal_app.py`:
 ```
 interpret/
 ├── app/                          # Next.js app directory
-│   ├── page.tsx                  # Main page with upload/download logic
+│   ├── page.tsx                  # Main page: YouTube URL / MP3 drop zone, progress, downloads
 │   ├── layout.tsx                # Root layout
 │   └── globals.css               # Global styles (Tailwind v4)
 ├── components/                   # React components
 │   └── ui/
-│       ├── file-upload.tsx       # Drag-and-drop upload (react-dropzone)
 │       ├── input.tsx             # Input component
 │       └── simple-growth-tree.tsx # Animated tree visualization
 ├── lib/                          # Utility functions
