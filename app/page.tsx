@@ -8,10 +8,11 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Upload, X } from "lucide-react";
 import { useCallback, useState } from "react";
 import { useDropzone, type FileRejection } from "react-dropzone";
-import type { SeparationRequest, SeparationResult } from "@/lib/types";
+import { LANGUAGE_OPTIONS, type SeparationRequest, type SeparationResult } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+const AUTO = "auto";
 
 const formatFileSize = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
@@ -43,6 +44,8 @@ export default function Home() {
   const [processingStatus, setProcessingStatus] = useState<string>("");
   const [progress, setProgress] = useState<number>(0);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [language1, setLanguage1] = useState<string>("en");
+  const [language2, setLanguage2] = useState<string>(AUTO);
 
   const onDrop = useCallback((accepted: File[], rejections: FileRejection[]) => {
     if (rejections.length > 0) {
@@ -85,7 +88,10 @@ export default function Home() {
 
     try {
       setProcessingStatus("Reading audio file...");
-      const requestBody: SeparationRequest = { audio_base64: await fileToBase64(audioFile) };
+      const requestBody: SeparationRequest = {
+        audio_base64: await fileToBase64(audioFile),
+        languages: [language1, language2].filter((code) => code !== AUTO),
+      };
       setProcessingStatus(`Uploading ${formatFileSize(audioFile.size)}...`);
 
       const modalEndpoint = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
@@ -162,11 +168,12 @@ export default function Home() {
     }
   };
 
-  const handleDownload = (language: 'language1' | 'language2', trackName: string) => {
+  const handleDownload = (track: 'lang1' | 'lang2') => {
     if (!result) return;
 
     try {
-      const blob = base64ToBlob(result[language], 'audio/mpeg');
+      const blob = base64ToBlob(result[track === 'lang1' ? 'language1' : 'language2'], 'audio/mpeg');
+      const trackName = result.languages[track].name.toLowerCase();
 
       // Create download link
       const url = URL.createObjectURL(blob);
@@ -253,14 +260,36 @@ export default function Home() {
               <Button
                 type="submit"
                 className="cursor-pointer rounded-em"
-                disabled={isProcessing || !audioFile}
+                disabled={isProcessing || !audioFile || (language1 !== AUTO && language1 === language2)}
               >
                 {isProcessing ? 'Processing...' : 'Separate'}
               </Button>
             </div>
-            <p className="text-xs text-neutral-500 mt-2">
-              MP3 files up to {formatFileSize(MAX_UPLOAD_BYTES)}
-            </p>
+            <div className="flex items-center gap-2 mt-2 text-xs text-neutral-500">
+              <span>Languages:</span>
+              {([
+                [language1, setLanguage1, 'Track 1 language'],
+                [language2, setLanguage2, 'Track 2 language'],
+              ] as const).map(([value, setValue, label]) => (
+                <select
+                  key={label}
+                  aria-label={label}
+                  value={value}
+                  disabled={isProcessing}
+                  onChange={(e) => setValue(e.target.value)}
+                  className="h-7 rounded-md border border-input bg-transparent px-2 text-xs text-neutral-700 disabled:opacity-50"
+                >
+                  <option value={AUTO}>Auto-detect</option>
+                  {LANGUAGE_OPTIONS.map((lang) => (
+                    <option key={lang.code} value={lang.code}>{lang.name}</option>
+                  ))}
+                </select>
+              ))}
+              <span className="ml-auto">MP3 files up to {formatFileSize(MAX_UPLOAD_BYTES)}</span>
+            </div>
+            {language1 !== AUTO && language1 === language2 && (
+              <p className="text-xs text-red-600 mt-1">Pick two different languages (or Auto-detect).</p>
+            )}
           </form>
         </div>
 
@@ -309,24 +338,26 @@ export default function Home() {
                 <p className="text-sm text-neutral-700 dark:text-neutral-300 mb-1">
                   Audio separation complete! Download your tracks:
                 </p>
-                <p className="text-xs text-neutral-500 mb-4">
+                <p className="text-xs text-neutral-500 mb-1">
                   {formatDuration(result.duration_seconds)} of audio processed in {formatDuration(result.timings.total)}
+                  {' · '}{result.num_speakers} {result.num_speakers === 1 ? 'voice' : 'voices'}
                 </p>
-                <div className="flex gap-2 justify-center">
-                  <Button
-                    onClick={() => handleDownload('language1', 'language1_track')}
-                    variant="default"
-                    className="cursor-pointer rounded-sm"
-                  >
-                    Download Track 1
-                  </Button>
-                  <Button
-                    onClick={() => handleDownload('language2', 'language2_track')}
-                    variant="default"
-                    className="cursor-pointer rounded-sm"
-                  >
-                    Download Track 2
-                  </Button>
+                {result.uncertain_seconds > 0 && (
+                  <p className="text-xs text-neutral-500 mb-1">
+                    {formatDuration(result.uncertain_seconds)} of short fragments were routed by voice rather than by language
+                  </p>
+                )}
+                <div className="flex gap-2 justify-center mt-4">
+                  {(['lang1', 'lang2'] as const).map((track) => (
+                    <Button
+                      key={track}
+                      onClick={() => handleDownload(track)}
+                      variant="default"
+                      className="cursor-pointer rounded-sm"
+                    >
+                      Download {result.languages[track].name} ({formatDuration(result.languages[track].seconds)})
+                    </Button>
+                  ))}
                 </div>
               </CardContent>
             </Card>
