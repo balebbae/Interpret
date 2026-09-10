@@ -8,28 +8,80 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Upload, X } from "lucide-react";
 import { useCallback, useState } from "react";
 import { useDropzone, type FileRejection } from "react-dropzone";
-import { LANGUAGE_OPTIONS, type SeparationRequest, type SeparationResult } from "@/lib/types";
+import {
+  LANGUAGE_OPTIONS,
+  type SeparationRequest,
+  type SeparationResult,
+  type UploadStart,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+const UPLOAD_PARALLELISM = 3;
+const UPLOAD_RETRIES = 3;
 const AUTO = "auto";
 
 const formatFileSize = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
-// Reads via data URL so large files are encoded natively instead of byte-by-byte in JS
-const fileToBase64 = (file: File) =>
-  new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      resolve(dataUrl.slice(dataUrl.indexOf(',') + 1));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error('Failed to read file'));
-    reader.readAsDataURL(file);
-  });
+const apiBase = () => {
+  const base = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
+  if (!base) throw new Error('Modal endpoint not configured');
+  return base.replace(/\/+$/, '');
+};
 
-const base64ToBlob = (base64: string, type: string) =>
-  new Blob([Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))], { type });
+const apiError = async (response: Response, fallback: string) => {
+  try {
+    const body = await response.json();
+    return new Error(body.detail ?? body.message ?? fallback);
+  } catch {
+    return new Error(fallback);
+  }
+};
+
+// Upload the file to the API in fixed-size chunks (a few in flight, each retried) and
+// return the job id the server assembled it under.
+const uploadFile = async (file: File, onProgress: (sentBytes: number) => void) => {
+  const base = apiBase();
+  const startRes = await fetch(`${base}/upload`, { method: 'POST' });
+  if (!startRes.ok) throw await apiError(startRes, 'Failed to start upload');
+  const { job_id, chunk_bytes }: UploadStart = await startRes.json();
+
+  const chunkCount = Math.max(1, Math.ceil(file.size / chunk_bytes));
+  let sent = 0;
+  let next = 0;
+
+  const putChunk = async (index: number) => {
+    const blob = file.slice(index * chunk_bytes, (index + 1) * chunk_bytes);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await fetch(`${base}/upload/${job_id}/${index}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blob,
+        });
+        if (!res.ok) throw await apiError(res, `Upload failed (chunk ${index + 1})`);
+        break;
+      } catch (err) {
+        if (attempt >= UPLOAD_RETRIES) throw err;
+      }
+    }
+    sent += blob.size;
+    onProgress(sent);
+  };
+
+  const worker = async () => {
+    while (next < chunkCount) await putChunk(next++);
+  };
+  await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLELISM, chunkCount) }, worker));
+
+  const doneRes = await fetch(`${base}/upload/${job_id}/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chunks: chunkCount }),
+  });
+  if (!doneRes.ok) throw await apiError(doneRes, 'Failed to finish upload');
+  return job_id;
+};
 
 const formatDuration = (seconds: number) => {
   const m = Math.floor(seconds / 60);
@@ -87,20 +139,18 @@ export default function Home() {
     setProcessingStatus("Initializing...");
 
     try {
-      setProcessingStatus("Reading audio file...");
+      // Upload occupies the first 20% of the progress bar
+      setProcessingStatus(`Uploading ${formatFileSize(audioFile.size)}...`);
+      const jobId = await uploadFile(audioFile, (sent) => {
+        setProgress(Math.round((sent / audioFile.size) * 20));
+        setProcessingStatus(`Uploading ${formatFileSize(sent)} of ${formatFileSize(audioFile.size)}...`);
+      });
+
       const requestBody: SeparationRequest = {
-        audio_base64: await fileToBase64(audioFile),
+        job_id: jobId,
         languages: [language1, language2].filter((code) => code !== AUTO),
       };
-      setProcessingStatus(`Uploading ${formatFileSize(audioFile.size)}...`);
-
-      const modalEndpoint = process.env.NEXT_PUBLIC_MODAL_ENDPOINT;
-      if (!modalEndpoint) {
-        throw new Error('Modal endpoint not configured');
-      }
-
-      // Use fetch with streaming for Server-Sent Events
-      const response = await fetch(modalEndpoint, {
+      const response = await fetch(`${apiBase()}/separate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -110,19 +160,16 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        throw new Error('Failed to start processing');
+        throw await apiError(response, 'Failed to start processing');
       }
 
       if (!response.body) {
         throw new Error('No response body');
       }
 
-      // Read the SSE stream. The final `complete` event carries both MP3s and can be
-      // hundreds of MB, so only scan newly received bytes for the event delimiter.
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let scanFrom = 0;
       let finished = false;
 
       while (!finished) {
@@ -132,10 +179,9 @@ export default function Home() {
         buffer += decoder.decode(value, { stream: true });
 
         let delimiter: number;
-        while ((delimiter = buffer.indexOf('\n\n', scanFrom)) !== -1) {
+        while ((delimiter = buffer.indexOf('\n\n')) !== -1) {
           const message = buffer.slice(0, delimiter);
           buffer = buffer.slice(delimiter + 2);
-          scanFrom = 0;
 
           const dataStart = message.indexOf('\ndata: ');
           if (!message.startsWith('event: ') || dataStart === -1) continue;
@@ -144,7 +190,7 @@ export default function Home() {
           const data = JSON.parse(message.slice(dataStart + 7));
 
           if (eventType === 'progress') {
-            setProgress(data.progress);
+            setProgress(20 + Math.round(data.progress * 0.8));
             setProcessingStatus(data.message);
           } else if (eventType === 'complete') {
             setResult(data as SeparationResult);
@@ -156,7 +202,10 @@ export default function Home() {
             throw new Error(data.message);
           }
         }
-        scanFrom = Math.max(0, buffer.length - 1);
+      }
+
+      if (!finished) {
+        throw new Error('Connection closed before processing finished');
       }
 
     } catch (err) {
@@ -168,26 +217,17 @@ export default function Home() {
     }
   };
 
+  // The API serves the track as an attachment named after its language, so the
+  // browser downloads it directly without the file passing through JS memory.
   const handleDownload = (track: 'lang1' | 'lang2') => {
     if (!result) return;
-
-    try {
-      const blob = base64ToBlob(result[track === 'lang1' ? 'language1' : 'language2'], 'audio/mpeg');
-      const trackName = result.languages[track].name.toLowerCase();
-
-      // Create download link
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${trackName}.mp3`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error('Failed to download file:', err);
-      setError('Failed to download file');
-    }
+    const a = document.createElement('a');
+    a.href = `${apiBase()}${result.downloads[track]}`;
+    a.download = `${result.languages[track].name.toLowerCase()}.mp3`;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   return (
