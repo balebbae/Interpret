@@ -10,12 +10,12 @@ Interpret allows users to upload an MP3 file containing bilingual audio (e.g., s
 
 ### High-Level Flow
 
-1. **Input**: User drops an MP3 file (browser converts it to base64)
-2. **Process**: Request sent directly to Modal GPU endpoint as `{audio_base64, languages: ["en", "zh"]}` (languages optional)
+1. **Upload**: User drops an MP3 file; the browser uploads it in 8 MB chunks (`POST /upload`, `PUT /upload/{job}/{n}`, `POST /upload/{job}/complete`) into a shared Modal Volume
+2. **Process**: `POST /separate` with `{job_id, languages: ["en", "zh"]}` (languages optional) streams progress over SSE while an L4 GPU works
 3. **Diarize**: pyannote.audio finds every speech turn
 4. **Identify**: Whisper labels each turn with its spoken language
-5. **Return**: Two base64-encoded MP3s (one per language) plus metadata and stage timings
-6. **Download**: Browser decodes and offers file downloads
+5. **Return**: The `complete` event carries only metadata (languages, timings, segments) and two download paths
+6. **Download**: Browser fetches each track directly from `GET /download/{job}/{lang1|lang2}` (named `english.mp3`, `chinese.mp3`, ...); jobs expire after 24 h
 
 ### Audio Processing Pipeline (Modal GPU)
 
@@ -91,7 +91,8 @@ starting before the preacher finishes) is included in both tracks.
    modal deploy modal_app.py
    ```
 
-   Copy the web endpoint URL to your `.env.local`.
+   Copy the `api` web endpoint URL (e.g. `https://<workspace>--audio-separator-api.modal.run`) to your `.env.local`.
+   Note: the endpoint URL changes with this release — the old `.../audioseparator-separate.modal.run` URL no longer exists.
 
    To test the service without the frontend:
    ```bash
