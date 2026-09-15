@@ -152,6 +152,11 @@ starting before the preacher finishes) is included in both tracks.
    Copy the `api` web endpoint URL (e.g. `https://<workspace>--audio-separator-api.modal.run`) to your `.env.local`.
    Note: the endpoint URL changes with this release — the old `.../audioseparator-separate.modal.run` URL no longer exists.
 
+   **Automatic deploys:** `.github/workflows/modal-deploy.yml` runs `modal deploy` whenever a
+   push to `main` touches `run-service/` (or manually via *Actions → Deploy Modal service → Run
+   workflow*). Add `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` as repository Actions secrets
+   (create a token at https://modal.com/settings/tokens).
+
    To test the service without the frontend:
    ```bash
    modal run modal_app.py --path ./sermon.mp3 --out-dir ./out --languages en,zh
