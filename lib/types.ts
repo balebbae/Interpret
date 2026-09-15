@@ -19,9 +19,16 @@ export const LANGUAGE_OPTIONS = [
 
 export type LanguageCode = (typeof LANGUAGE_OPTIONS)[number]["code"];
 
-// Request to Modal audio separation endpoint
+// POST /upload -> new job to receive chunks
+export interface UploadStart {
+  job_id: string;
+  chunk_bytes: number;
+  max_bytes: number;
+}
+
+// POST /separate: run the separation on an uploaded job
 export interface SeparationRequest {
-  audio_base64: string; // Base64 encoded MP3 upload
+  job_id: string;
   languages?: string[]; // 0-2 language codes; missing ones are auto-detected
 }
 
@@ -31,10 +38,10 @@ export interface TrackLanguage {
   seconds: number; // speech routed to this track
 }
 
-// `complete` SSE event from the Modal audio separation endpoint
+// `complete` SSE event from POST /separate
 export interface SeparationResult {
-  language1: string; // Base64 encoded MP3
-  language2: string; // Base64 encoded MP3
+  job_id: string;
+  downloads: { lang1: string; lang2: string }; // paths relative to the API base URL
   model: string;
   duration_seconds: number;
   languages: { lang1: TrackLanguage; lang2: TrackLanguage };

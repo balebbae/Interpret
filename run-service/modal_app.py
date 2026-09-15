@@ -10,19 +10,34 @@ Takes an uploaded MP3 and splits it into one track per language:
 3. The turns of each language are cut from the native-rate audio and encoded to MP3.
 
 Routing by language rather than by speaker means any number of preachers,
-interpreters or announcers is handled correctly. Progress is streamed over SSE.
+interpreters or announcers is handled correctly.
+
+Transport: a small CPU web app (`api`) receives the file in chunks and serves the
+results; a shared Volume holds each job's input and output MP3s. The GPU class only
+sees a job id, and streams progress back to the web app over a Modal generator,
+which forwards it to the browser as SSE. Nothing is base64-encoded.
 """
 
 import modal
 import os
+import re
+import shutil
 import tempfile
-import base64
 import subprocess
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 app = modal.App("audio-separator")
+
+# Job storage shared between the web app and the GPU worker
+JOBS_VOLUME = modal.Volume.from_name("audio-separator-jobs", create_if_missing=True)
+JOBS_DIR = "/jobs"
+JOB_TTL_SEC = 24 * 3600         # results stay downloadable this long
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_CHUNK_BYTES = 32 * 1024 * 1024
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+TRACK_FILES = {"lang1": "language1.mp3", "lang2": "language2.mp3"}
 
 DIARIZATION_SR = 16000
 MP3_BITRATE = "128k"
@@ -71,11 +86,12 @@ image = (
         "openai-whisper==20231117",
         "numpy==1.26.4",
         "huggingface_hub==0.23.5",
-        "fastapi",
     )
     .env({"HF_HOME": "/root/.cache/huggingface"})
     .run_function(download_models, secrets=[modal.Secret.from_name("huggingface")])
 )
+
+web_image = modal.Image.debian_slim(python_version="3.11").pip_install("fastapi[standard]==0.115.12")
 
 
 # --------------------------------------------------------------------------- #
@@ -272,18 +288,23 @@ def build_track(audio_int16, sample_rate: int, spans, fade_sec: float = FADE_SEC
     return np.concatenate(chunks)
 
 
-def validate_languages(requested):
-    """Normalise the optional `languages` request field to a list of Whisper language codes."""
-    from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
-
+def check_languages_shape(requested):
+    """Structural check of the optional `languages` field (no Whisper needed). Returns a list."""
     if requested is None:
         return []
     if not isinstance(requested, list) or len(requested) > 2:
         raise ValueError("languages must be a list of at most two language codes, e.g. [\"en\", \"zh\"]")
+    if not all(isinstance(lang, str) for lang in requested):
+        raise ValueError("languages must be strings")
+    return requested
+
+
+def validate_languages(requested):
+    """Normalise the optional `languages` request field to a list of Whisper language codes."""
+    from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+
     codes = []
-    for lang in requested:
-        if not isinstance(lang, str):
-            raise ValueError("languages must be strings")
+    for lang in check_languages_shape(requested):
         code = lang.strip().lower()
         code = TO_LANGUAGE_CODE.get(code, code)
         if code not in LANGUAGES:
@@ -300,6 +321,62 @@ def language_name(code: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Job storage helpers (paths under the shared Volume)
+# --------------------------------------------------------------------------- #
+
+def job_path(job_id: str, root: str = JOBS_DIR) -> str:
+    """Directory for a job; rejects anything that is not a hex uuid so ids cannot escape `root`."""
+    if not isinstance(job_id, str) or not JOB_ID_RE.match(job_id):
+        raise ValueError("Invalid job id")
+    return os.path.join(root, job_id)
+
+
+def chunk_path(job_dir: str, index: int) -> str:
+    return os.path.join(job_dir, f"chunk-{index:05d}")
+
+
+def assemble_chunks(job_dir: str, n_chunks: int, max_bytes: int = MAX_UPLOAD_BYTES) -> int:
+    """Concatenate chunk-00000..chunk-{n-1} into input.mp3, delete the chunks. Returns byte size."""
+    if n_chunks < 1:
+        raise ValueError("Upload has no chunks")
+    parts = [chunk_path(job_dir, i) for i in range(n_chunks)]
+    missing = [p for p in parts if not os.path.exists(p)]
+    if missing:
+        raise ValueError(f"Upload incomplete: {len(missing)} of {n_chunks} chunks missing")
+    total = sum(os.path.getsize(p) for p in parts)
+    if total == 0:
+        raise ValueError("Uploaded audio file is empty")
+    if total > max_bytes:
+        raise ValueError(f"File is too large ({total / 2**20:.0f} MB); the maximum is {max_bytes // 2**20} MB")
+
+    output = os.path.join(job_dir, "input.mp3")
+    with open(output, "wb") as out:
+        for p in parts:
+            with open(p, "rb") as f:
+                shutil.copyfileobj(f, out, 1024 * 1024)
+    for p in parts:
+        os.remove(p)
+    return total
+
+
+def purge_old_jobs(root: str, ttl: float = JOB_TTL_SEC, now: float | None = None) -> int:
+    """Delete job directories not modified for `ttl` seconds. Returns how many were removed."""
+    now = time.time() if now is None else now
+    removed = 0
+    if not os.path.isdir(root):
+        return 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and now - os.path.getmtime(path) > ttl:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+# --------------------------------------------------------------------------- #
 # Modal service
 # --------------------------------------------------------------------------- #
 
@@ -307,6 +384,7 @@ def language_name(code: str) -> str:
     gpu="L4",
     image=image,
     secrets=[modal.Secret.from_name("huggingface")],
+    volumes={JOBS_DIR: JOBS_VOLUME},
     timeout=1800,  # 30 minute timeout for very long audio files
     scaledown_window=360,  # Keep warm for 6 minutes
     memory=8192,
@@ -508,192 +586,244 @@ class AudioSeparator:
         return probs
 
     # ------------------------------------------------------------------ #
-    # Entry points
+    # Entry point
     # ------------------------------------------------------------------ #
 
     @modal.method()
-    def separate_bytes(self, audio_bytes: bytes, languages=None) -> dict:
-        """Synchronous variant used by `modal run` for local testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            input_path = os.path.join(tmpdir, "input.mp3")
-            with open(input_path, "wb") as f:
-                f.write(audio_bytes)
-
-            def log_progress(stage, message, percent):
-                print(f"[{percent:3d}%] {stage}: {message}")
-
-            result = self._run_pipeline(input_path, tmpdir, log_progress, languages)
-            with open(result["tracks"][0], "rb") as f:
-                result["language1"] = f.read()
-            with open(result["tracks"][1], "rb") as f:
-                result["language2"] = f.read()
-            del result["tracks"]
-            return result
-
-    @modal.fastapi_endpoint(method="POST")
-    async def separate(self, item: dict):
+    def separate_job(self, job_id: str, languages=None):
         """
-        Process an uploaded MP3 and stream results back as Server-Sent Events.
+        Generator. Separates `<volume>/<job_id>/input.mp3`, writes the two tracks next to it
+        and yields ("progress", {stage, message, progress}) events followed by one
+        ("complete", metadata) event. Raised exceptions propagate to the caller.
+        """
+        import json
+        import queue
 
-        Expects JSON: {"audio_base64": "<base64 MP3>", "languages": ["en", "zh"] (optional)}
-        `languages` holds 0-2 Whisper language codes; missing ones are auto-detected.
+        job_dir = job_path(job_id)
+        input_path = os.path.join(job_dir, "input.mp3")
+        if not os.path.exists(input_path):
+            JOBS_VOLUME.reload()
+        if not os.path.exists(input_path):
+            raise FileNotFoundError("Upload not found; it may have expired")
+        languages = validate_languages(languages)
 
+        events: queue.Queue = queue.Queue()
+
+        def progress(stage, message, percent):
+            events.put(("progress", {"stage": stage, "message": message, "progress": percent}))
+
+        with tempfile.TemporaryDirectory() as tmpdir, ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self._run_pipeline, input_path, tmpdir, progress, languages)
+            future.add_done_callback(lambda f: events.put(("done", f)))
+            while True:
+                kind, payload = events.get()
+                if kind == "progress":
+                    yield kind, payload
+                else:
+                    result = payload.result()  # re-raises pipeline errors
+                    break
+
+            yield "progress", {"stage": "publish", "message": "Publishing tracks...", "progress": 95}
+            tracks = result.pop("tracks")
+            for track, src in zip(("lang1", "lang2"), tracks):
+                shutil.copyfile(src, os.path.join(job_dir, TRACK_FILES[track]))
+            result["duration_seconds"] = round(result["duration_seconds"], 1)
+            with open(os.path.join(job_dir, "result.json"), "w") as f:
+                json.dump(result, f)
+            os.remove(input_path)
+            JOBS_VOLUME.commit()
+
+        yield "complete", result
+
+
+# --------------------------------------------------------------------------- #
+# Web API (CPU): chunked upload -> SSE separation -> direct downloads
+# --------------------------------------------------------------------------- #
+
+@app.function(image=web_image, volumes={JOBS_DIR: JOBS_VOLUME}, timeout=1800)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def api():
+    """
+    POST /upload                         -> {job_id}
+    PUT  /upload/{job_id}/{index}        raw bytes of chunk `index`
+    POST /upload/{job_id}/complete       {chunks: n} -> {size_bytes}
+    POST /separate                       {job_id, languages?: [...]} -> SSE progress/complete/error
+    GET  /download/{job_id}/{lang1|lang2} -> audio/mpeg attachment named after the language
+    """
+    import asyncio
+    import json
+    import traceback
+    import uuid
+
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import Response, StreamingResponse
+
+    web = FastAPI()
+    web.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    )
+
+    def job_dir_or_400(job_id: str) -> str:
+        try:
+            return job_path(job_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def ensure_visible(*paths: str):
+        """Pull the latest Volume state if any of `paths` was written by another container."""
+        if not all(os.path.exists(p) for p in paths):
+            try:
+                await JOBS_VOLUME.reload.aio()
+            except Exception as e:  # e.g. another request has a file open
+                print(f"Volume reload skipped: {e}")
+
+    @web.post("/upload")
+    async def start_upload():
+        job_id = uuid.uuid4().hex
+        os.makedirs(job_path(job_id), exist_ok=True)
+        removed = purge_old_jobs(JOBS_DIR)
+        if removed:
+            print(f"Purged {removed} expired jobs")
+        await JOBS_VOLUME.commit.aio()
+        return {"job_id": job_id, "chunk_bytes": 8 * 1024 * 1024, "max_bytes": MAX_UPLOAD_BYTES}
+
+    @web.put("/upload/{job_id}/{index}")
+    async def upload_chunk(job_id: str, index: int, request: Request):
+        job_dir = job_dir_or_400(job_id)
+        if index < 0 or index >= 10**5:
+            raise HTTPException(status_code=400, detail="Invalid chunk index")
+        body = await request.body()
+        if not body or len(body) > MAX_CHUNK_BYTES:
+            raise HTTPException(status_code=413, detail="Chunk must be between 1 byte and 32 MB")
+        await ensure_visible(job_dir)
+        if not os.path.isdir(job_dir):
+            raise HTTPException(status_code=404, detail="Unknown upload")
+        with open(chunk_path(job_dir, index), "wb") as f:
+            f.write(body)
+        await JOBS_VOLUME.commit.aio()
+        return {"job_id": job_id, "index": index, "bytes": len(body)}
+
+    @web.post("/upload/{job_id}/complete")
+    async def complete_upload(job_id: str, item: dict):
+        job_dir = job_dir_or_400(job_id)
+        n_chunks = item.get("chunks")
+        if not isinstance(n_chunks, int) or n_chunks < 1:
+            raise HTTPException(status_code=400, detail="chunks must be a positive integer")
+        await ensure_visible(*(chunk_path(job_dir, i) for i in range(n_chunks)))
+        try:
+            size = assemble_chunks(job_dir, n_chunks)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        await JOBS_VOLUME.commit.aio()
+        return {"job_id": job_id, "size_bytes": size}
+
+    @web.post("/separate")
+    async def separate(item: dict):
+        """
         Events:
         - progress: {stage, message, progress}
-        - complete: {language1, language2, model, duration_seconds, languages: {lang1: {code, name,
-                     seconds}, lang2: {...}}, languages_requested, num_speakers, num_segments,
-                     uncertain_seconds, segments: [[start, end, "lang1"|"lang2"], ...], timings,
-                     progress: 100}
+        - complete: {job_id, downloads: {lang1, lang2}, model, duration_seconds,
+                     languages: {lang1: {code, name, seconds}, lang2: {...}}, languages_requested,
+                     num_speakers, num_segments, uncertain_seconds,
+                     segments: [[start, end, "lang1"|"lang2"], ...], timings, progress: 100}
         - error:    {message}
         """
-        from fastapi.responses import StreamingResponse
-        import asyncio
-        import json
-        import traceback
+        def send_event(event_type: str, data: dict) -> str:
+            return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
         async def event_generator():
-            def send_event(event_type: str, data: dict) -> str:
-                return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-
             try:
-                audio_base64 = item.get("audio_base64")
-                if not audio_base64:
-                    yield send_event("error", {"message": "audio_base64 is required"})
-                    return
+                job_id = item.get("job_id")
                 try:
-                    languages = validate_languages(item.get("languages"))
+                    job_path(job_id)
+                    languages = check_languages_shape(item.get("languages"))
                 except ValueError as e:
                     yield send_event("error", {"message": str(e)})
                     return
 
-                loop = asyncio.get_running_loop()
-
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    input_path = os.path.join(tmpdir, "input.mp3")
-
-                    yield send_event("progress", {
-                        "stage": "upload", "message": "Upload received, decoding audio...", "progress": 5,
-                    })
-                    await asyncio.sleep(0)
-
-                    try:
-                        size_mb = await loop.run_in_executor(
-                            None, self._write_uploaded_audio, audio_base64, input_path
-                        )
-                    except ValueError as e:
-                        yield send_event("error", {"message": str(e)})
-                        return
-
-                    yield send_event("progress", {
-                        "stage": "upload", "message": f"Received {size_mb:.1f} MB of audio", "progress": 25,
-                    })
-                    await asyncio.sleep(0)
-
-                    # Run the blocking pipeline in a worker thread; it reports progress
-                    # through a queue so we can keep streaming SSE events meanwhile.
-                    queue: asyncio.Queue = asyncio.Queue()
-
-                    def progress(stage, message, percent):
-                        loop.call_soon_threadsafe(
-                            queue.put_nowait,
-                            ("progress", {"stage": stage, "message": message, "progress": percent}),
-                        )
-
-                    future = loop.run_in_executor(
-                        None, self._run_pipeline, input_path, tmpdir, progress, languages
-                    )
-                    future.add_done_callback(lambda f: queue.put_nowait(("done", f)))
-
-                    while True:
-                        kind, payload = await queue.get()
-                        if kind == "progress":
-                            yield send_event("progress", payload)
-                        else:
-                            result = payload.result()  # re-raises pipeline errors
-                            break
-
-                    yield send_event("progress", {
-                        "stage": "encode", "message": "Encoding results...", "progress": 95,
-                    })
-                    await asyncio.sleep(0)
-
-                    with open(result["tracks"][0], "rb") as f:
-                        lang1_bytes = f.read()
-                    with open(result["tracks"][1], "rb") as f:
-                        lang2_bytes = f.read()
-
-                    yield send_event("complete", {
-                        "language1": base64.b64encode(lang1_bytes).decode("utf-8"),
-                        "language2": base64.b64encode(lang2_bytes).decode("utf-8"),
-                        "model": result["model"],
-                        "duration_seconds": round(result["duration_seconds"], 1),
-                        "languages": result["languages"],
-                        "languages_requested": result["languages_requested"],
-                        "num_speakers": result["num_speakers"],
-                        "num_segments": result["num_segments"],
-                        "uncertain_seconds": result["uncertain_seconds"],
-                        "segments": result["segments"],
-                        "timings": result["timings"],
-                        "progress": 100,
-                    })
-
+                yield send_event("progress", {
+                    "stage": "queue", "message": "Waiting for a GPU...", "progress": 2,
+                })
+                # Progress arrives while the GPU works; the connection must show activity meanwhile.
+                stream = AudioSeparator().separate_job.remote_gen.aio(job_id, languages)
+                async for kind, payload in stream:
+                    if kind == "progress":
+                        yield send_event("progress", payload)
+                    else:
+                        yield send_event("complete", {
+                            "job_id": job_id,
+                            "downloads": {t: f"/download/{job_id}/{t}" for t in TRACK_FILES},
+                            **payload,
+                            "progress": 100,
+                        })
             except Exception as e:
-                print(f"Error in event_generator: {e}")
+                print(f"Error in /separate: {e}")
                 print(traceback.format_exc())
                 yield send_event("error", {"message": str(e)})
 
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @web.get("/download/{job_id}/{track}")
+    async def download(job_id: str, track: str):
+        job_dir = job_dir_or_400(job_id)
+        if track not in TRACK_FILES:
+            raise HTTPException(status_code=404, detail="Unknown track")
+        path = os.path.join(job_dir, TRACK_FILES[track])
+        meta_path = os.path.join(job_dir, "result.json")
+        await ensure_visible(path, meta_path)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="Track not found; results expire after 24 hours")
+        try:
+            with open(meta_path) as f:
+                name = json.load(f)["languages"][track]["name"]
+        except (OSError, KeyError, ValueError):
+            name = track
+        # Read fully rather than streaming so no file stays open across a Volume reload.
+        data = await asyncio.to_thread(lambda: open(path, "rb").read())
+        return Response(
+            content=data,
+            media_type="audio/mpeg",
             headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-                "X-Accel-Buffering": "no",
+                "Content-Disposition": f'attachment; filename="{name.lower()}.mp3"',
+                "Cache-Control": "private, max-age=3600",
             },
         )
 
-    def _write_uploaded_audio(self, audio_base64: str, output_path: str) -> float:
-        """Decode a base64 MP3 upload to disk. Returns size in MB."""
-        import binascii
-
-        # Tolerate a data URL prefix ("data:audio/mpeg;base64,...")
-        if audio_base64.startswith("data:"):
-            audio_base64 = audio_base64.split(",", 1)[-1]
-
-        try:
-            audio_bytes = base64.b64decode(audio_base64, validate=True)
-        except (binascii.Error, ValueError):
-            raise ValueError("audio_base64 is not valid base64 data")
-
-        if not audio_bytes:
-            raise ValueError("Uploaded audio file is empty")
-
-        with open(output_path, "wb") as f:
-            f.write(audio_bytes)
-
-        size_mb = len(audio_bytes) / (1024 * 1024)
-        print(f"Wrote uploaded audio: {size_mb:.1f} MB -> {output_path}")
-        return size_mb
+    return web
 
 
 @app.local_entrypoint()
 def main(path: str, out_dir: str = ".", languages: str = ""):
     """Test the separator: modal run modal_app.py --path ./sermon.mp3 [--out-dir ./out] [--languages en,zh]"""
     import json
+    import uuid
 
-    with open(path, "rb") as f:
-        audio_bytes = f.read()
+    job_id = uuid.uuid4().hex
+    with JOBS_VOLUME.batch_upload() as batch:
+        batch.put_file(path, f"/{job_id}/input.mp3")
+    print(f"Uploaded {os.path.getsize(path) / 2**20:.1f} MB as job {job_id}")
 
     codes = [c for c in languages.split(",") if c.strip()] or None
-    result = AudioSeparator().separate_bytes.remote(audio_bytes, codes)
+    result = None
+    for kind, payload in AudioSeparator().separate_job.remote_gen(job_id, codes):
+        if kind == "progress":
+            print(f"[{payload['progress']:3d}%] {payload['stage']}: {payload['message']}")
+        else:
+            result = payload
 
     os.makedirs(out_dir, exist_ok=True)
     for track in ("lang1", "lang2"):
         info = result["languages"][track]
         name = f"{info['name'].lower()}.mp3"
         with open(os.path.join(out_dir, name), "wb") as f:
-            f.write(result.pop("language1" if track == "lang1" else "language2"))
+            for chunk in JOBS_VOLUME.read_file(f"{job_id}/{TRACK_FILES[track]}"):
+                f.write(chunk)
         print(f"{track}: {info['name']} ({info['code']}), {info['seconds'] / 60:.1f} min -> {name}")
     with open(os.path.join(out_dir, "result.json"), "w") as f:
         json.dump(result, f, indent=2)

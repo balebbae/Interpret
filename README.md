@@ -8,14 +8,72 @@ Interpret allows users to upload an MP3 file containing bilingual audio (e.g., s
 
 ## How It Works
 
+### Request Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser (Next.js)
+    participant A as api (Modal CPU, FastAPI)
+    participant V as Volume /jobs
+    participant G as AudioSeparator (Modal L4 GPU)
+
+    B->>A: POST /upload
+    A-->>B: {job_id, chunk_bytes}
+    loop 8 MB chunks, 3 in flight
+        B->>A: PUT /upload/{job_id}/{index}
+        A->>V: chunk-00000..n
+    end
+    B->>A: POST /upload/{job_id}/complete {chunks}
+    A->>V: assemble -> input.mp3
+    B->>A: POST /separate {job_id, languages?}
+    A->>G: separate_job(job_id, languages) generator
+    G->>V: read input.mp3
+    loop while processing
+        G-->>A: progress {stage, message, %}
+        A-->>B: SSE event: progress
+    end
+    G->>V: language1.mp3, language2.mp3, result.json
+    G-->>A: complete metadata
+    A-->>B: SSE event: complete {downloads, languages, timings, ...}
+    B->>A: GET /download/{job_id}/lang1 | lang2
+    A->>V: read track
+    A-->>B: audio/mpeg (english.mp3, chinese.mp3, ...)
+```
+
+### Audio Pipeline (inside the GPU worker)
+
+```mermaid
+flowchart TD
+    IN["input.mp3"] --> D16["ffmpeg decode<br/>16 kHz mono float32, peak-normalised"]
+    IN --> DN["ffmpeg decode (parallel)<br/>native-rate mono int16"]
+    D16 --> DIA["pyannote/speaker-diarization-3.1<br/>FP32, no speaker-count constraint"]
+    DIA --> TURNS["speech turns<br/>(start, end, SPEAKER_xx)"]
+    TURNS --> UNITS["split into <= 20 s units<br/>drop < 0.4 s"]
+    D16 --> LID
+    UNITS --> LID["Whisper small language head<br/>probabilities per unit"]
+    LANGS["requested languages<br/>or top-2 by weighted duration"] --> RESTRICT["restrict to the two languages"]
+    LID --> RESTRICT
+    RESTRICT --> CONF{"confidence >= 0.8?"}
+    CONF -- yes --> LABEL["language label"]
+    CONF -- no --> FALLBACK["majority language of the same<br/>voice within +/- 2 min"] --> LABEL
+    LABEL --> CLEAN["clean-up: drop < 0.25 s,<br/>pad 0.15 s, merge gaps < 0.5 s"]
+    CLEAN --> BUILD["cut native-rate audio<br/>15 ms fades, concatenate per language"]
+    DN --> BUILD
+    BUILD --> ENC["ffmpeg libmp3lame 128 kbps<br/>(both tracks in parallel)"]
+    ENC --> T1["language1.mp3"]
+    ENC --> T2["language2.mp3"]
+    ENC --> META["result.json<br/>languages, segments, uncertain_seconds, timings"]
+```
+
 ### High-Level Flow
 
-1. **Input**: User drops an MP3 file (browser converts it to base64)
-2. **Process**: Request sent directly to Modal GPU endpoint as `{audio_base64, languages: ["en", "zh"]}` (languages optional)
+1. **Upload**: User drops an MP3 file; the browser uploads it in 8 MB chunks (`POST /upload`, `PUT /upload/{job}/{n}`, `POST /upload/{job}/complete`) into a shared Modal Volume
+2. **Process**: `POST /separate` with `{job_id, languages: ["en", "zh"]}` (languages optional) streams progress over SSE while an L4 GPU works
 3. **Diarize**: pyannote.audio finds every speech turn
 4. **Identify**: Whisper labels each turn with its spoken language
-5. **Return**: Two base64-encoded MP3s (one per language) plus metadata and stage timings
-6. **Download**: Browser decodes and offers file downloads
+5. **Return**: The `complete` event carries only metadata (languages, timings, segments) and two download paths
+6. **Download**: Browser fetches each track directly from `GET /download/{job}/{lang1|lang2}` (named `english.mp3`, `chinese.mp3`, ...); jobs expire after 24 h
 
 ### Audio Processing Pipeline (Modal GPU)
 
@@ -91,7 +149,8 @@ starting before the preacher finishes) is included in both tracks.
    modal deploy modal_app.py
    ```
 
-   Copy the web endpoint URL to your `.env.local`.
+   Copy the `api` web endpoint URL (e.g. `https://<workspace>--audio-separator-api.modal.run`) to your `.env.local`.
+   Note: the endpoint URL changes with this release — the old `.../audioseparator-separate.modal.run` URL no longer exists.
 
    To test the service without the frontend:
    ```bash
