@@ -330,6 +330,18 @@ export default function Home() {
             {language1 !== AUTO && language1 === language2 && (
               <p className="text-xs text-red-600 mt-1">Pick two different languages (or Auto-detect).</p>
             )}
+            <p className="mt-2 text-xs text-neutral-500">
+              Have a YouTube link? Convert it to MP3 first with{' '}
+              <a
+                href="https://convertytmp3.org/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline hover:text-neutral-700"
+              >
+                convertytmp3.org
+              </a>
+              , then upload the file here.
+            </p>
           </form>
         </div>
 
