@@ -8,6 +8,64 @@ Interpret allows users to upload an MP3 file containing bilingual audio (e.g., s
 
 ## How It Works
 
+### Request Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser (Next.js)
+    participant A as api (Modal CPU, FastAPI)
+    participant V as Volume /jobs
+    participant G as AudioSeparator (Modal L4 GPU)
+
+    B->>A: POST /upload
+    A-->>B: {job_id, chunk_bytes}
+    loop 8 MB chunks, 3 in flight
+        B->>A: PUT /upload/{job_id}/{index}
+        A->>V: chunk-00000..n
+    end
+    B->>A: POST /upload/{job_id}/complete {chunks}
+    A->>V: assemble -> input.mp3
+    B->>A: POST /separate {job_id, languages?}
+    A->>G: separate_job(job_id, languages) generator
+    G->>V: read input.mp3
+    loop while processing
+        G-->>A: progress {stage, message, %}
+        A-->>B: SSE event: progress
+    end
+    G->>V: language1.mp3, language2.mp3, result.json
+    G-->>A: complete metadata
+    A-->>B: SSE event: complete {downloads, languages, timings, ...}
+    B->>A: GET /download/{job_id}/lang1 | lang2
+    A->>V: read track
+    A-->>B: audio/mpeg (english.mp3, chinese.mp3, ...)
+```
+
+### Audio Pipeline (inside the GPU worker)
+
+```mermaid
+flowchart TD
+    IN["input.mp3"] --> D16["ffmpeg decode<br/>16 kHz mono float32, peak-normalised"]
+    IN --> DN["ffmpeg decode (parallel)<br/>native-rate mono int16"]
+    D16 --> DIA["pyannote/speaker-diarization-3.1<br/>FP32, no speaker-count constraint"]
+    DIA --> TURNS["speech turns<br/>(start, end, SPEAKER_xx)"]
+    TURNS --> UNITS["split into <= 20 s units<br/>drop < 0.4 s"]
+    D16 --> LID
+    UNITS --> LID["Whisper small language head<br/>probabilities per unit"]
+    LANGS["requested languages<br/>or top-2 by weighted duration"] --> RESTRICT["restrict to the two languages"]
+    LID --> RESTRICT
+    RESTRICT --> CONF{"confidence >= 0.8?"}
+    CONF -- yes --> LABEL["language label"]
+    CONF -- no --> FALLBACK["majority language of the same<br/>voice within +/- 2 min"] --> LABEL
+    LABEL --> CLEAN["clean-up: drop < 0.25 s,<br/>pad 0.15 s, merge gaps < 0.5 s"]
+    CLEAN --> BUILD["cut native-rate audio<br/>15 ms fades, concatenate per language"]
+    DN --> BUILD
+    BUILD --> ENC["ffmpeg libmp3lame 128 kbps<br/>(both tracks in parallel)"]
+    ENC --> T1["language1.mp3"]
+    ENC --> T2["language2.mp3"]
+    ENC --> META["result.json<br/>languages, segments, uncertain_seconds, timings"]
+```
+
 ### High-Level Flow
 
 1. **Upload**: User drops an MP3 file; the browser uploads it in 8 MB chunks (`POST /upload`, `PUT /upload/{job}/{n}`, `POST /upload/{job}/complete`) into a shared Modal Volume
