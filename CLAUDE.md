@@ -25,18 +25,21 @@ modal deploy modal_app.py                                               # Deploy
 ## Architecture
 
 **Frontend (Next.js 16 + React 19):**
+
 - Single-page app: MP3 drag/drop plus two language selectors (Auto-detect or a Whisper language code)
 - Talks directly to the Modal web API (`NEXT_PUBLIC_MODAL_ENDPOINT`): chunked upload, then SSE for progress
 - Real-time progress tracking (upload → queue → preprocess → diarization → language_id → build → export → publish)
 - Downloads are plain links to `GET /download/{job_id}/{lang1|lang2}`; nothing is base64-encoded anywhere
 
 **Backend Processing (Modal Serverless GPU, `run-service/modal_app.py`):**
+
 - CPU web function `api` (FastAPI, `web_image`): upload/separate/download routes, shares the `audio-separator-jobs` Volume mounted at `/jobs`
 - Stateful Modal class `AudioSeparator` on an L4 GPU; pyannote 3.1 and Whisper `small` are pre-loaded once per container; `separate_job(job_id, languages)` is a generator invoked with `remote_gen.aio`
 - Routes audio by **language**, not by speaker; any number of voices is fine
 - Jobs live at `/jobs/<32-hex uuid>/` (`input.mp3` → `language1.mp3`, `language2.mp3`, `result.json`) and are purged after 24 h
 
 **Data Flow:**
+
 1. Browser `POST /upload` → `{job_id, chunk_bytes}`; `PUT /upload/{job_id}/{index}` raw 8 MB chunks (3 in flight); `POST /upload/{job_id}/complete {chunks}` assembles them (200 MB max)
 2. Browser `POST /separate {job_id, languages?: ["en", "zh"]}` (0–2 codes; missing ones are auto-detected); the API streams the GPU generator's events as SSE
 3. ffmpeg decodes a 16 kHz mono copy (models) and, in parallel, a native-rate int16 copy (output)
@@ -70,3 +73,5 @@ HUGGING_FACE_TOKEN=hf_xxx                                         # Modal secret
 - `run-service/modal_app.py` - GPU processing service with AudioSeparator class and SSE streaming
 - `lib/types.ts` - TypeScript interfaces for requests/responses and the language option list
 - `components/ui/simple-growth-tree.tsx` - Animated tree visualization (decorative)
+
+EDIT CLAUDE MD FILE
